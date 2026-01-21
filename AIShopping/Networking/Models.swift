@@ -6,8 +6,11 @@
 //
 import Foundation
 
-struct ProductCandidate: Codable, Identifiable {
-    let id: UUID
+// MARK: - Identify Models
+
+struct ProductCandidate: Codable, Identifiable, Hashable {
+    var id: UUID = UUID()
+
     let brand: String?
     let name: String
     let model: String?
@@ -15,21 +18,8 @@ struct ProductCandidate: Codable, Identifiable {
     let canonical_query: String
     let confidence: Double
 
-    // ✅ Decode-friendly UUID
-    init(id: UUID = UUID(),
-         brand: String? = nil,
-         name: String,
-         model: String? = nil,
-         upc: String? = nil,
-         canonical_query: String,
-         confidence: Double) {
-        self.id = id
-        self.brand = brand
-        self.name = name
-        self.model = model
-        self.upc = upc
-        self.canonical_query = canonical_query
-        self.confidence = confidence
+    enum CodingKeys: String, CodingKey {
+        case brand, name, model, upc, canonical_query, confidence
     }
 }
 
@@ -40,8 +30,11 @@ struct IdentifyResponse: Codable {
     let raw_model_output: String?
 }
 
-struct Offer: Codable, Identifiable {
-    let id: UUID
+// MARK: - Offers Models (matches /v1/offers)
+
+struct OfferItem: Codable, Identifiable, Hashable {
+    var id: UUID = UUID()
+
     let title: String
     let price: String?
     let source: String?
@@ -51,33 +44,13 @@ struct Offer: Codable, Identifiable {
     let rating: Double?
     let reviews: Int?
 
-    init(id: UUID = UUID(),
-         title: String,
-         price: String? = nil,
-         source: String? = nil,
-         link: String? = nil,
-         thumbnail: String? = nil,
-         delivery: String? = nil,
-         rating: Double? = nil,
-         reviews: Int? = nil) {
-        self.id = id
-        self.title = title
-        self.price = price
-        self.source = source
-        self.link = link
-        self.thumbnail = thumbnail
-        self.delivery = delivery
-        self.rating = rating
-        self.reviews = reviews
+    enum CodingKeys: String, CodingKey {
+        case title, price, source, link, thumbnail, delivery, rating, reviews
     }
 }
 
 struct OffersResponse: Codable {
     let query: String
-    let offers: [Offer]
-    let raw: [String: AnyCodable]?
+    let offers: [OfferItem]
+    let raw: [String: String]? // backend returns null, so Optional is fine
 }
-
-/// ✅ Minimal “AnyCodable” helper so the optional `raw` dict can decode without crashing.
-/// You can remove `raw` entirely if you prefer.
-struct AnyCodable: Codable {}

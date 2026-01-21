@@ -8,31 +8,67 @@
 import SwiftUI
 
 struct OfferCard: View {
-    let offer: Offer
+    let offer: OfferItem
     let isBest: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(offer.merchant).bold()
+        VStack(alignment: .leading, spacing: 8) {
+
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(offer.source ?? "Unknown store")
+                        .font(.headline)
+
+                    Text(offer.title)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+
                 Spacer()
-                if isBest { Text("BEST").bold().foregroundStyle(.green) }
+
+                if isBest {
+                    Text("BEST")
+                        .font(.caption)
+                        .bold()
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.green.opacity(0.2))
+                        .clipShape(Capsule())
+                }
             }
 
-            Text(String(format: "Total: $%.2f", offer.total_delivered))
-
-            if offer.is_membership_required {
-                Text("Membership required").font(.footnote).foregroundStyle(.orange)
+            if let price = offer.price {
+                Text("Price: \(price)")
+                    .font(.body)
+                    .bold()
             }
 
-            if let items = offer.bundle_items, !items.isEmpty {
-                Text("Bundle: \(items.joined(separator: ", "))")
+            if let delivery = offer.delivery {
+                Text(delivery)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
-            Link("Buy", destination: URL(string: offer.url)!)
+            if let rating = offer.rating {
+                if let reviews = offer.reviews {
+                    Text(String(format: "Rating: %.1f (\(reviews) reviews)", rating))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(String(format: "Rating: %.1f", rating))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let link = offer.link, let url = URL(string: link) {
+                Link("Open Offer", destination: url)
+                    .font(.footnote)
+            }
         }
-        .padding(.vertical, 6)
+        .padding()
+        .background(.thinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 18))
     }
 }
