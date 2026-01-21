@@ -19,5 +19,6 @@ final class AppState: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
 
+    // ✅ fixed
     let api = APIClient()
 }
