@@ -4,23 +4,41 @@ from app.schemas.offers import OffersResponse, OfferItem
 
 router = APIRouter(prefix="/v1", tags=["offers"])
 
-# Terms that usually indicate irrelevant medical/chiropractic tables for this app
 NEGATIVE_HINTS = [
     "chiropractic",
     "chiropractor",
     "traction",
     "clinic",
     "medical",
+    "treatment",
+    "therapy",
+    "adjusting",
+    "bolster",
     "armedica",
     "mettler",
     "flexion",
     "distraction",
+    "graham field",
 ]
 
+def normalize(s: str) -> str:
+    return (s or "").strip().lower()
+
 def is_irrelevant(title: str, q: str) -> bool:
-    t = (title or "").lower()
-    # For now: drop obvious medical table results
-    return any(h in t for h in NEGATIVE_HINTS)
+    t = normalize(title)
+
+    # Drop obvious medical/treatment results
+    if any(h in t for h in NEGATIVE_HINTS):
+        return True
+
+    # Require brand match for Chirp queries (tighten relevance)
+    qn = normalize(q)
+    if "chirp" in qn:
+        # title must contain chirp OR contain "contour decompression"
+        if ("chirp" not in t) and ("contour" not in t or "decompression" not in t):
+            return True
+
+    return False
 
 @router.get("/offers", response_model=OffersResponse)
 async def offers(
@@ -29,23 +47,17 @@ async def offers(
     gl: str = Query("us"),
     hl: str = Query("en"),
 ):
-    """
-    Pulls Google Shopping offers via SerpAPI.
-    Adds basic filtering and link normalization.
-    """
     try:
         raw = await shopping_search(q, num=num, gl=gl, hl=hl)
-
         results = raw.get("shopping_results", []) or []
 
         offers = []
         for r in results:
             title = r.get("title", "Unknown")
 
-            # Prefer product_link (common) then link (fallback)
+            # SerpAPI tends to use product_link; link may exist on some results too
             link = r.get("product_link") or r.get("link")
 
-            # Basic relevance filtering (removes obvious medical/chiropractic tables)
             if is_irrelevant(title, q):
                 continue
 
