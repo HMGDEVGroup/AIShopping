@@ -12,18 +12,32 @@ struct ResultsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Best Deals").font(.title2).bold()
+            Text("Best Prices").font(.title2).bold()
 
             if let res = state.offersResponse {
-                Text(res.explanation).font(.footnote).foregroundStyle(.secondary)
-
                 List {
-                    ForEach(Array(res.offers.enumerated()), id: \.element.id) { idx, offer in
-                        OfferCard(offer: offer, isBest: idx == res.best_offer_index)
+                    ForEach(res.offers) { o in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(o.title).bold()
+                            HStack {
+                                Text(o.price ?? "—")
+                                Spacer()
+                                Text(o.source ?? "")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .font(.subheadline)
+
+                            if let link = o.link, let url = URL(string: link) {
+                                Link("Open Deal", destination: url)
+                                    .font(.subheadline)
+                            }
+                        }
+                        .padding(.vertical, 6)
                     }
                 }
             } else {
-                Text("No offers loaded.")
+                Text("No offers loaded yet.")
+                    .foregroundStyle(.secondary)
             }
         }
         .padding()

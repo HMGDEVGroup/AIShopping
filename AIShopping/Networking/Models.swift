@@ -7,6 +7,7 @@
 import Foundation
 
 struct ProductCandidate: Codable, Identifiable {
+    let id: UUID
     let brand: String?
     let name: String
     let model: String?
@@ -14,11 +15,21 @@ struct ProductCandidate: Codable, Identifiable {
     let canonical_query: String
     let confidence: Double
 
-    // Computed id (not part of Codable)
-    var id: String {
-        // Stable-ish: use UPC if present, else brand+name+model
-        if let upc, !upc.isEmpty { return "upc:\(upc)" }
-        return "cand:\(brand ?? "")|\(name)|\(model ?? "")"
+    // ✅ Decode-friendly UUID
+    init(id: UUID = UUID(),
+         brand: String? = nil,
+         name: String,
+         model: String? = nil,
+         upc: String? = nil,
+         canonical_query: String,
+         confidence: Double) {
+        self.id = id
+        self.brand = brand
+        self.name = name
+        self.model = model
+        self.upc = upc
+        self.canonical_query = canonical_query
+        self.confidence = confidence
     }
 }
 
@@ -30,25 +41,43 @@ struct IdentifyResponse: Codable {
 }
 
 struct Offer: Codable, Identifiable {
-    let merchant: String
-    let url: String
-    let price: Double
-    let shipping: Double
-    let tax_est: Double
-    let total_delivered: Double
-    let currency: String
-    let is_membership_required: Bool
-    let bundle_items: [String]?
-    let match_confidence: Double
+    let id: UUID
+    let title: String
+    let price: String?
+    let source: String?
+    let link: String?
+    let thumbnail: String?
+    let delivery: String?
+    let rating: Double?
+    let reviews: Int?
 
-    // Computed id (not part of Codable)
-    var id: String {
-        "offer:\(merchant)|\(url)"
+    init(id: UUID = UUID(),
+         title: String,
+         price: String? = nil,
+         source: String? = nil,
+         link: String? = nil,
+         thumbnail: String? = nil,
+         delivery: String? = nil,
+         rating: Double? = nil,
+         reviews: Int? = nil) {
+        self.id = id
+        self.title = title
+        self.price = price
+        self.source = source
+        self.link = link
+        self.thumbnail = thumbnail
+        self.delivery = delivery
+        self.rating = rating
+        self.reviews = reviews
     }
 }
 
 struct OffersResponse: Codable {
+    let query: String
     let offers: [Offer]
-    let best_offer_index: Int
-    let explanation: String
+    let raw: [String: AnyCodable]?
 }
+
+/// ✅ Minimal “AnyCodable” helper so the optional `raw` dict can decode without crashing.
+/// You can remove `raw` entirely if you prefer.
+struct AnyCodable: Codable {}

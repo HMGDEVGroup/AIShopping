@@ -9,100 +9,120 @@ import UIKit
 
 final class APIClient {
 
-    static let shared = APIClient()
+    private let baseURL: URL
 
-    // ✅ Render backend
-    private let baseURL = URL(string: "https://aishopping-api.onrender.com")!
+    // ✅ Public init
+    init(baseURL: URL = URL(string: "https://aishopping-api.onrender.com")!) {
+        self.baseURL = baseURL
+    }
 
-    private init() {}
+    enum APIError: LocalizedError {
+        case badURL
+        case badResponse
+        case serverError(status: Int, body: String)
+        case decodeError(String)
 
-    // MARK: - Compatibility wrappers (so your existing UI compiles)
+        var errorDescription: String? {
+            switch self {
+            case .badURL: return "Bad URL"
+            case .badResponse: return "Bad server response"
+            case let .serverError(status, body):
+                return "Server returned status \(status): \(body)"
+            case let .decodeError(msg):
+                return "Decode error: \(msg)"
+            }
+        }
+    }
 
-    /// Your UI calls: state.api.identify(image:)
+    // MARK: - Identify
+
     func identify(image: UIImage) async throws -> IdentifyResponse {
-        return try await identifyProduct(from: image)
-    }
-
-    /// Your UI calls: state.api.offers(canonicalQuery:includeMembership:)
-    /// We haven’t built the Offers backend yet, so this returns a clear error for now.
-    func offers(canonicalQuery: String, includeMembership: Bool) async throws -> OffersResponse {
-        throw NSError(
-            domain: "APIClient",
-            code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "Offers API not implemented yet. Next step is to build /v1/offers on the backend."]
-        )
-    }
-
-    // MARK: - Identify Product (Upload Image -> /v1/identify)
-
-    func identifyProduct(from uiImage: UIImage) async throws -> IdentifyResponse {
-
-        let url = baseURL.appendingPathComponent("v1/identify")
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 60
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        guard let imageData = uiImage.pngData() else {
-            throw URLError(.cannotDecodeContentData)
+        guard let url = URL(string: "/v1/identify", relativeTo: baseURL) else {
+            throw APIError.badURL
         }
 
         let boundary = "Boundary-\(UUID().uuidString)"
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "accept")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        request.httpBody = createMultipartBody(
-            boundary: boundary,
-            fieldName: "image",          // ✅ MUST be "image" (matches FastAPI)
-            fileName: "upload.png",
-            mimeType: "image/png",
-            fileData: imageData
-        )
+        guard let pngData = image.pngData() else {
+            throw APIError.decodeError("Unable to create PNG data from UIImage")
+        }
 
-        // ✅ DEBUG PRINTS (requested)
+        var body = Data()
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: image/png\r\n\r\n".data(using: .utf8)!)
+        body.append(pngData)
+        body.append("\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+
+        request.httpBody = body
+
+        // ✅ Debug prints
         print("IDENTIFY URL:", request.url?.absoluteString ?? "nil")
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
-        // ✅ DEBUG PRINTS (requested)
+        // ✅ Debug prints
         print("STATUS:", (response as? HTTPURLResponse)?.statusCode ?? -1)
         print("BODY:", String(data: data, encoding: .utf8) ?? "nil")
 
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            throw NSError(
-                domain: "APIClient",
-                code: http.statusCode,
-                userInfo: [
-                    NSLocalizedDescriptionKey: "Server returned status \(http.statusCode)",
-                    "body": String(data: data, encoding: .utf8) ?? ""
-                ]
-            )
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.badResponse
         }
 
-        let decoder = JSONDecoder()
-        return try decoder.decode(IdentifyResponse.self, from: data)
+        if !(200...299).contains(http.statusCode) {
+            let bodyText = String(data: data, encoding: .utf8) ?? ""
+            throw APIError.serverError(status: http.statusCode, body: bodyText)
+        }
+
+        do {
+            return try JSONDecoder().decode(IdentifyResponse.self, from: data)
+        } catch {
+            throw APIError.decodeError(error.localizedDescription)
+        }
     }
 
-    // MARK: - Multipart Helper
+    // MARK: - Offers (REAL)
 
-    private func createMultipartBody(
-        boundary: String,
-        fieldName: String,
-        fileName: String,
-        mimeType: String,
-        fileData: Data
-    ) -> Data {
+    func offers(canonicalQuery: String, includeMembership: Bool) async throws -> OffersResponse {
+        var comps = URLComponents(url: baseURL.appendingPathComponent("/v1/offers"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "q", value: canonicalQuery),
+            URLQueryItem(name: "num", value: "10"),
+            URLQueryItem(name: "gl", value: "us"),
+            URLQueryItem(name: "hl", value: "en"),
+        ]
 
-        var body = Data()
+        guard let url = comps?.url else { throw APIError.badURL }
 
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"\(fieldName)\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
-        body.append(fileData)
-        body.append("\r\n".data(using: .utf8)!)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "accept")
 
-        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        print("OFFERS URL:", request.url?.absoluteString ?? "nil")
 
-        return body
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        print("STATUS:", (response as? HTTPURLResponse)?.statusCode ?? -1)
+        print("BODY:", String(data: data, encoding: .utf8) ?? "nil")
+
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.badResponse
+        }
+
+        if !(200...299).contains(http.statusCode) {
+            let bodyText = String(data: data, encoding: .utf8) ?? ""
+            throw APIError.serverError(status: http.statusCode, body: bodyText)
+        }
+
+        do {
+            return try JSONDecoder().decode(OffersResponse.self, from: data)
+        } catch {
+            throw APIError.decodeError(error.localizedDescription)
+        }
     }
 }
