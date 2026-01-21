@@ -12,63 +12,39 @@ struct OfferCard: View {
     let isBest: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
 
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(offer.source ?? "Unknown store")
-                        .font(.headline)
-
-                    Text(offer.title)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                }
+            HStack {
+                Text(offer.source ?? "Unknown seller")
+                    .bold()
 
                 Spacer()
 
                 if isBest {
                     Text("BEST")
-                        .font(.caption)
                         .bold()
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(.green.opacity(0.2))
-                        .clipShape(Capsule())
+                        .foregroundStyle(.green)
                 }
             }
 
-            if let price = offer.price {
-                Text("Price: \(price)")
-                    .font(.body)
-                    .bold()
-            }
+            Text(offer.title)
+                .font(.subheadline)
 
-            if let delivery = offer.delivery {
-                Text(delivery)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let rating = offer.rating {
-                if let reviews = offer.reviews {
-                    Text(String(format: "Rating: %.1f (\(reviews) reviews)", rating))
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(String(format: "Rating: %.1f", rating))
-                        .font(.footnote)
+            HStack {
+                Text(offer.price ?? "—")
+                Spacer()
+                if let delivery = offer.delivery, !delivery.isEmpty {
+                    Text(delivery)
                         .foregroundStyle(.secondary)
                 }
             }
+            .font(.footnote)
 
             if let link = offer.link, let url = URL(string: link) {
-                Link("Open Offer", destination: url)
-                    .font(.footnote)
+                Link("Open Deal", destination: url)
+                    .font(.subheadline)
             }
         }
-        .padding()
-        .background(.thinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .padding(.vertical, 6)
     }
 }

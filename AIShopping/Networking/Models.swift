@@ -6,22 +6,7 @@
 //
 import Foundation
 
-// MARK: - Identify Models
-
-struct ProductCandidate: Codable, Identifiable, Hashable {
-    var id: UUID = UUID()
-
-    let brand: String?
-    let name: String
-    let model: String?
-    let upc: String?
-    let canonical_query: String
-    let confidence: Double
-
-    enum CodingKeys: String, CodingKey {
-        case brand, name, model, upc, canonical_query, confidence
-    }
-}
+// MARK: - Identify
 
 struct IdentifyResponse: Codable {
     let primary: ProductCandidate
@@ -30,11 +15,29 @@ struct IdentifyResponse: Codable {
     let raw_model_output: String?
 }
 
-// MARK: - Offers Models (matches /v1/offers)
+struct ProductCandidate: Codable, Identifiable {
+    let brand: String?
+    let name: String
+    let model: String?
+    let upc: String?
+    let canonical_query: String
+    let confidence: Double
 
-struct OfferItem: Codable, Identifiable, Hashable {
-    var id: UUID = UUID()
+    // Stable id for SwiftUI lists
+    var id: String {
+        "\(canonical_query)|\(brand ?? "")|\(name)|\(model ?? "")|\(upc ?? "")"
+    }
+}
 
+// MARK: - Offers
+
+struct OffersResponse: Codable {
+    let query: String
+    let offers: [OfferItem]
+    let raw: [String: String]?   // backend returns null currently; keep optional
+}
+
+struct OfferItem: Codable, Identifiable {
     let title: String
     let price: String?
     let source: String?
@@ -44,13 +47,8 @@ struct OfferItem: Codable, Identifiable, Hashable {
     let rating: Double?
     let reviews: Int?
 
-    enum CodingKeys: String, CodingKey {
-        case title, price, source, link, thumbnail, delivery, rating, reviews
+    // Stable id for SwiftUI lists
+    var id: String {
+        link ?? "\(title)|\(source ?? "")|\(price ?? "")"
     }
-}
-
-struct OffersResponse: Codable {
-    let query: String
-    let offers: [OfferItem]
-    let raw: [String: String]? // backend returns null, so Optional is fine
 }
