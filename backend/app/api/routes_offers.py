@@ -26,6 +26,11 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
 
 
 def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
+    """
+    SerpApi may return:
+      - price: "$599.99"
+      - extracted_price / price_extracted: 599.99
+    """
     price_str = r.get("price")
     price_val = None
 
@@ -130,6 +135,7 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
         "amount",
     ]
 
+    # "key": 499.99 OR "key":"499.99"
     for k in keys:
         pat = rf'"{re.escape(k)}"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
         m = re.search(pat, html, re.IGNORECASE)
@@ -141,6 +147,7 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
             except Exception:
                 pass
 
+    # "key": {"value": 499.99}
     for k in keys:
         pat = rf'"{re.escape(k)}"\s*:\s*\{{[^}}]*"value"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
         m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
@@ -155,186 +162,105 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
     return None
 
 
-def _extract_price_from_serpapi_organic_result(r: dict) -> Optional[float]:
+async def _download_html(url: str) -> Optional[str]:
     """
-    Try to extract a price from SerpApi 'google' engine organic result.
-    Places it may appear:
-      - snippet
-      - rich_snippet (varies)
-      - extensions / detected_extensions (varies)
+    1) Try direct fetch (often blocked by Costco)
+    2) If blocked/non-200, fallback to a readable proxy fetch that returns the HTML.
+       Proxy used: r.jina.ai (very reliable for blocked sites).
     """
-    candidates: List[str] = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
-    snippet = r.get("snippet")
-    if isinstance(snippet, str) and snippet.strip():
-        candidates.append(snippet)
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        try:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 200 and r.text and len(r.text) > 2000:
+                return r.text
+        except Exception:
+            pass
 
-    # SerpApi sometimes uses these fields (depends on result type)
-    for k in ("extensions", "detected_extensions"):
-        v = r.get(k)
-        if isinstance(v, list):
-            for item in v:
-                if isinstance(item, str) and item.strip():
-                    candidates.append(item)
-
-    rich = r.get("rich_snippet")
-    # rich_snippet can be a dict with nested structures; pull all strings out
-    if rich:
-        for d in _iter_json_objects(rich):
-            for vv in d.values():
-                if isinstance(vv, str) and vv.strip():
-                    candidates.append(vv)
-
-    # Look for a $ price in any candidate string
-    for text in candidates:
-        m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", text)
-        if m:
-            pv = _parse_price_value(m.group(0))
-            if pv is not None and _plausible_price(pv):
-                return pv
+        # Fallback: proxy
+        try:
+            # r.jina.ai expects "https://r.jina.ai/http(s)://..."
+            proxied = "https://r.jina.ai/" + url
+            r2 = await client.get(proxied, headers=headers)
+            if r2.status_code == 200 and r2.text and len(r2.text) > 2000:
+                return r2.text
+        except Exception:
+            pass
 
     return None
 
 
 async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]:
-    """
-    Best-effort Costco price extraction.
-    NOTE: Costco often blocks bots or renders price via JS, so this can still return None.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            r = await client.get(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache",
-                },
-            )
-            if r.status_code != 200:
-                return None, None
-            html = r.text
-
-        pv = _try_extract_price_from_ld_json(html)
-        if pv is not None:
-            return f"${pv:,.2f}", pv
-
-        pv2 = _try_extract_price_from_json_patterns(html)
-        if pv2 is not None:
-            return f"${pv2:,.2f}", pv2
-
-        m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
-        if m:
-            price_str = f"${m.group(1)}"
-            price_val = _parse_price_value(price_str)
-            if price_val is not None and _plausible_price(price_val):
-                return price_str, price_val
-
-        return None, None
-    except Exception:
+    html = await _download_html(url)
+    if not html:
         return None, None
 
+    pv = _try_extract_price_from_ld_json(html)
+    if pv is not None:
+        return f"${pv:,.2f}", pv
 
-async def _costco_from_serpapi_shopping(q: str, gl: str, hl: str) -> Optional[OfferItem]:
-    """
-    Try to find Costco as a merchant in SerpApi Google Shopping results.
-    """
-    raw = await shopping_search(
-        q=f"{q} Costco",
-        gl=gl,
-        hl=hl,
-        num=60,
-        no_cache=True,
-    )
+    pv2 = _try_extract_price_from_json_patterns(html)
+    if pv2 is not None:
+        return f"${pv2:,.2f}", pv2
 
-    results = raw.get("shopping_results", []) or []
-    for r in results:
-        src = (_extract_source(r) or "").lower()
-        title = str(r.get("title") or "").lower()
-        link = (_extract_link(r) or "").lower()
-        # accept variations like "costco", "costco wholesale", or costco.com in link/title
-        if ("costco" in src) or ("costco" in title) or ("costco.com" in link):
-            price_str, price_val = _extract_price_fields(r)
-            if price_val is not None:
-                return OfferItem(
-                    title=r.get("title", "Costco offer"),
-                    price=price_str,
-                    price_value=price_val,
-                    source=_extract_source(r) or "Costco",
-                    link=_extract_link(r),
-                    thumbnail=r.get("thumbnail"),
-                    delivery=r.get("delivery"),
-                    rating=r.get("rating"),
-                    reviews=r.get("reviews"),
-                )
+    m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
+    if m:
+        price_str = f"${m.group(1)}"
+        price_val = _parse_price_value(price_str)
+        if price_val is not None and _plausible_price(price_val):
+            return price_str, price_val
 
-    return None
+    return None, None
 
 
 async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem]:
-    """
-    Costco fallback strategy (best to worst):
-      1) SerpApi Google Shopping Costco merchant price (if present)
-      2) SerpApi Google web results: Costco.com result + parse price from snippet/extensions
-      3) Costco.com scrape (best-effort; often blocked/JS)
-      4) Return Costco link as membership offer with null price
-    """
-    # 1) Best path (when SerpApi shopping contains Costco price)
-    from_shopping = await _costco_from_serpapi_shopping(q=q, gl=gl, hl=hl)
-    if from_shopping:
-        return from_shopping
-
-    # 2) Google web search for Costco result + extract price from SerpApi fields
     web_q = f"site:costco.com {q}"
     raw = await google_search(q=web_q, gl=gl, hl=hl, num=10, no_cache=True)
 
     organic = raw.get("organic_results", []) or []
-    costco_result = None
+    costco_url = None
     for r in organic:
         link = r.get("link")
         if isinstance(link, str) and "costco.com" in link:
-            costco_result = r
+            costco_url = link
             break
 
-    if not costco_result:
+    if not costco_url:
         return None
 
-    costco_url = costco_result.get("link")
+    price_str, price_val = await _fetch_costco_price(costco_url)
 
-    # 2a) Try parse price directly from SerpApi web result (often works even when scraping fails)
-    pv = _extract_price_from_serpapi_organic_result(costco_result)
-    if pv is not None:
-        return OfferItem(
-            title="Costco (membership) - product page",
-            price=f"${pv:,.2f}",
-            price_value=pv,
-            source="Costco",
-            link=costco_url,
-            thumbnail=None,
-            delivery=None,
-            rating=None,
-            reviews=None,
-        )
+    # Also pull rating/reviews if present in SerpApi rich_snippet
+    rating = None
+    reviews = None
+    try:
+        rs = (r.get("rich_snippet") or {}).get("bottom") or {}
+        det = rs.get("detected_extensions") or {}
+        if isinstance(det.get("rating"), (int, float)):
+            rating = float(det["rating"])
+        if isinstance(det.get("reviews"), int):
+            reviews = det["reviews"]
+    except Exception:
+        pass
 
-    # 3) Try scrape Costco.com (best-effort)
-    if isinstance(costco_url, str) and costco_url.strip():
-        price_str, price_val = await _fetch_costco_price(costco_url)
-        return OfferItem(
-            title="Costco (membership) - product page",
-            price=price_str,
-            price_value=price_val,
-            source="Costco",
-            link=costco_url,
-            thumbnail=None,
-            delivery=None,
-            rating=None,
-            reviews=None,
-        )
-
-    # 4) If link missing for some reason
-    return None
+    return OfferItem(
+        title="Costco (membership) - product page",
+        price=price_str,
+        price_value=price_val,
+        source="Costco",
+        link=costco_url,
+        thumbnail=None,
+        delivery=None,
+        rating=rating,
+        reviews=reviews,
+    )
 
 
 @router.get("/offers", response_model=OffersResponse)
@@ -347,7 +273,7 @@ async def offers(
 ):
     """
     Returns offers sorted by best (lowest) parsed price first.
-    Also attempts a Costco fallback when include_membership=true.
+    Also attempts a Costco fallback (web search + page parse) when include_membership=true.
     """
     try:
         base_raw = await shopping_search(
@@ -376,6 +302,16 @@ async def offers(
                 )
             )
 
+        # If SerpApi returned a Costco offer but without price, attempt to enrich it
+        if include_membership:
+            for i, o in enumerate(list(offers_list)):
+                if (o.source or "").lower().strip() == "costco" and o.link and o.price_value is None:
+                    pstr, pval = await _fetch_costco_price(o.link)
+                    if pval is not None:
+                        offers_list[i].price = pstr
+                        offers_list[i].price_value = pval
+
+        # If still no Costco entry at all, add a Costco fallback
         if include_membership:
             has_costco = any("costco" in (o.source or "").lower() for o in offers_list)
             if not has_costco:
@@ -383,7 +319,7 @@ async def offers(
                 if costco_offer:
                     offers_list.append(costco_offer)
 
-        # Dedupe
+        # Dedupe (keep the one with a price if duplicates exist)
         deduped: Dict[str, OfferItem] = {}
         for o in offers_list:
             k = _key_for_dedupe(o)
@@ -396,7 +332,6 @@ async def offers(
 
         offers_list = list(deduped.values())
 
-        # Sort cheapest first (None prices go to end)
         offers_list.sort(
             key=lambda o: (
                 o.price_value is None,
