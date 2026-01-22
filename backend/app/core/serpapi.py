@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
 
@@ -9,7 +9,6 @@ SERPAPI_BASE = "https://serpapi.com/search.json"
 
 
 def _get_serpapi_key() -> str:
-    # Prefer pydantic settings, fallback to env
     key = (getattr(settings, "SERPAPI_API_KEY", "") or "").strip()
     if not key:
         key = (os.environ.get("SERPAPI_API_KEY", "") or "").strip()
@@ -22,33 +21,30 @@ async def shopping_search(
     q: str,
     gl: str = "us",
     hl: str = "en",
-    include_membership: bool = True,
-    num: int = 10,
+    num: int = 20,
+    no_cache: bool = True,
 ) -> Dict[str, Any]:
     """
-    Calls SerpAPI Google Shopping and returns the raw JSON response.
-
-    Notes:
-    - SerpAPI does not have a universal “include_membership” toggle; that concept is store-specific.
-      We keep the parameter so the API stays stable and you can add membership filtering later.
+    SerpAPI Google Shopping search.
     """
     api_key = _get_serpapi_key()
 
-    # SerpAPI Google Shopping engine
+    try:
+        n = max(1, min(int(num), 100))
+    except Exception:
+        n = 20
+
     params: Dict[str, Any] = {
         "engine": "google_shopping",
         "q": q,
         "api_key": api_key,
         "gl": gl,
         "hl": hl,
+        "num": n,
     }
 
-    # Best-effort: request more results so backend can sort/filter
-    # SerpAPI uses "num" for some engines; if ignored, it won't break.
-    try:
-        params["num"] = max(1, min(int(num), 100))
-    except Exception:
-        params["num"] = 10
+    if no_cache:
+        params["no_cache"] = "true"
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(SERPAPI_BASE, params=params)
@@ -59,7 +55,6 @@ async def shopping_search(
 
         data = r.json()
 
-    # Normalize: if the engine returns an error payload, surface it clearly
     if isinstance(data, dict) and data.get("error"):
         raise ValueError(f"SerpAPI error: {data.get('error')}")
 
