@@ -7,6 +7,17 @@ app = FastAPI(title="AI Shopping API", version="0.1.0")
 app.include_router(identify_router)
 app.include_router(offers_router)
 
+
+@app.get("/")
+def root():
+    return {
+        "name": "AI Shopping API",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
