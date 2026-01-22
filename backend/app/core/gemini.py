@@ -1,152 +1,156 @@
-import base64
-import json
 import os
-import re
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+import json
+import base64
+from typing import Optional, Any, Dict, Tuple
 
 import httpx
 
 
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 
 
-@dataclass
-class GeminiRateLimitError(Exception):
-    message: str
-    retry_after_seconds: Optional[int] = None
+class GeminiError(Exception):
+    pass
 
 
-@dataclass
-class GeminiRequestError(Exception):
-    message: str
-    status_code: Optional[int] = None
-    body: Optional[str] = None
+class GeminiRateLimitError(GeminiError):
+    def __init__(self, message: str, retry_after_seconds: Optional[int] = None, body: str = ""):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.body = body
 
 
-def _safe_snippet(s: str, limit: int = 4000) -> str:
-    s = s or ""
-    s = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "REDACTED_API_KEY", s)
-    return s[:limit]
+class GeminiNotFoundError(GeminiError):
+    def __init__(self, message: str, body: str = ""):
+        super().__init__(message)
+        self.body = body
 
 
-def _extract_retry_after_seconds(resp: httpx.Response, body_text: str) -> Optional[int]:
-    ra = resp.headers.get("retry-after")
-    if ra:
-        try:
-            return int(float(ra.strip()))
-        except Exception:
-            pass
+def _get_env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
 
-    # Gemini often includes retry info inside JSON error.details as {"retryDelay":"22s"}
+
+def _guess_mime(filename: str) -> str:
+    fn = (filename or "").lower()
+    if fn.endswith(".png"):
+        return "image/png"
+    if fn.endswith(".jpg") or fn.endswith(".jpeg"):
+        return "image/jpeg"
+    if fn.endswith(".webp"):
+        return "image/webp"
+    return "image/png"
+
+
+def _extract_retry_after_seconds(err_json: Dict[str, Any]) -> Optional[int]:
+    """
+    Gemini quota errors sometimes include:
+      error.details[].retryDelay = "27s"
+    """
     try:
-        data = json.loads(body_text or "{}")
-        err = data.get("error", {}) if isinstance(data, dict) else {}
-        details = err.get("details", []) if isinstance(err, dict) else []
+        details = err_json.get("error", {}).get("details", []) or []
         for d in details:
-            if isinstance(d, dict) and "retryDelay" in d:
-                v = str(d.get("retryDelay")).strip().lower()
-                # formats like "22s"
-                m = re.match(r"(\d+)\s*s", v)
-                if m:
-                    return int(m.group(1))
+            if isinstance(d, dict) and d.get("@type", "").endswith("google.rpc.RetryInfo"):
+                delay = d.get("retryDelay")
+                if isinstance(delay, str) and delay.endswith("s"):
+                    n = delay[:-1]
+                    if n.isdigit():
+                        return int(n)
     except Exception:
         pass
-
     return None
 
 
-async def identify_from_image(img_bytes: bytes) -> str:
+def _parse_gemini_text(resp_json: Dict[str, Any]) -> str:
     """
-    Sends an image to Gemini and returns the model's raw text output.
-    This function does NOT do any "model test call".
+    v1beta generateContent response typically:
+      { candidates: [ { content: { parts: [ { text: "..." } ] } } ] }
     """
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    candidates = resp_json.get("candidates") or []
+    if not candidates:
+        return ""
+
+    c0 = candidates[0] or {}
+    content = c0.get("content") or {}
+    parts = content.get("parts") or []
+    if not parts:
+        return ""
+
+    p0 = parts[0] or {}
+    txt = p0.get("text")
+    return txt if isinstance(txt, str) else ""
+
+
+async def identify_from_image(img_bytes: bytes, filename: str = "image.png") -> str:
+    """
+    Sends image to Gemini and returns model text (expected to be JSON string).
+    NOTE: No 'model test' call happens here.
+    """
+    api_key = _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY")
     if not api_key:
-        raise GeminiRequestError("GEMINI_API_KEY is not set", status_code=500)
+        raise GeminiError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) env var")
 
-    model = (os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
-    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent"
+    model = _get_env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 
+    mime_type = _guess_mime(filename)
     b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    # IMPORTANT: key is passed via x-goog-api-key header (not query param).  [oai_citation:1‡Google AI for Developers](https://ai.google.dev/api)
-    headers = {
-        "x-goog-api-key": api_key,
-        "Content-Type": "application/json",
-    }
+    prompt = (
+        "Identify the product in the image.\n"
+        "Return ONLY valid JSON with keys:\n"
+        "primary: { name, canonical_query, confidence, brand (optional), model (optional), upc (optional) }\n"
+        "candidates: [same shape]\n"
+        "notes: string|null\n"
+        "No markdown. No code fences. JSON only."
+    )
 
     payload: Dict[str, Any] = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": b64,
-                        }
-                    },
-                    {
-                        "text": (
-                            "Identify the primary product in this image.\n"
-                            "Return ONLY a single JSON object with keys:\n"
-                            "primary: {name, canonical_query, confidence, brand, model, upc}\n"
-                            "candidates: [same shape]\n"
-                            "notes: string|null\n"
-                            "No markdown fences. No extra text."
-                        )
-                    },
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime_type, "data": b64}},
                 ],
             }
         ],
-        "generationConfig": {
-            "temperature": 0.2,
-        },
+        # Optional: keep responses deterministic-ish
+        "generationConfig": {"temperature": 0.2},
     }
 
-    timeout = httpx.Timeout(60.0)
+    url = f"{GEMINI_ENDPOINT_BASE}/models/{model}:generateContent"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, params={"key": api_key}, json=payload)
 
-    body_text = resp.text or ""
+    body_text = r.text or ""
 
-    if resp.status_code == 429:
-        retry_after = _extract_retry_after_seconds(resp, body_text)
-        msg = "Gemini quota/rate limit exceeded"
-        raise GeminiRateLimitError(message=msg, retry_after_seconds=retry_after)
-
-    if resp.status_code >= 400:
-        # 404 often means wrong model name, or project/key not allowed for that model
-        raise GeminiRequestError(
-            message=f"Gemini request failed: {resp.status_code}",
-            status_code=resp.status_code,
-            body=_safe_snippet(body_text),
+    if r.status_code == 429:
+        retry_after = None
+        try:
+            j = r.json()
+            retry_after = _extract_retry_after_seconds(j)
+        except Exception:
+            retry_after = None
+        raise GeminiRateLimitError(
+            message="Gemini quota/rate limit exceeded",
+            retry_after_seconds=retry_after,
+            body=body_text,
         )
 
-    # Expected response shape: candidates[0].content.parts[0].text
+    if r.status_code == 404:
+        raise GeminiNotFoundError(
+            message=f"Gemini model not found (check GEMINI_MODEL='{model}')",
+            body=body_text,
+        )
+
+    if r.status_code >= 400:
+        raise GeminiError(f"Gemini request failed: {r.status_code}\nBODY:\n{body_text}")
+
     try:
-        data = resp.json()
+        resp_json = r.json()
     except Exception:
-        raise GeminiRequestError(
-            message="Gemini response was not JSON",
-            status_code=500,
-            body=_safe_snippet(body_text),
-        )
+        # If Gemini ever returns non-JSON, surface it
+        raise GeminiError(f"Gemini returned non-JSON response\nBODY:\n{body_text}")
 
-    try:
-        candidates = data.get("candidates") or []
-        content = (candidates[0] or {}).get("content") or {}
-        parts = content.get("parts") or []
-        text = (parts[0] or {}).get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("Missing text in Gemini response candidates[0].content.parts[0].text")
-        return text
-    except Exception as e:
-        raise GeminiRequestError(
-            message=f"Unexpected Gemini response shape: {e}",
-            status_code=500,
-            body=_safe_snippet(json.dumps(data) if isinstance(data, dict) else str(data)),
-        )
+    return _parse_gemini_text(resp_json)

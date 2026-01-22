@@ -2,7 +2,7 @@ import json
 import re
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
-from app.core.gemini import identify_from_image, GeminiRateLimitError, GeminiRequestError
+from app.core.gemini import identify_from_image, GeminiRateLimitError
 from app.schemas.identify import IdentifyResponse
 
 router = APIRouter(prefix="/v1", tags=["identify"])
@@ -41,13 +41,16 @@ async def identify(image: UploadFile = File(...)):
 
     try:
         img_bytes = await image.read()
-        raw_text = await identify_from_image(img_bytes)
+
+        # Pass filename so we can guess mime type better
+        raw_text = await identify_from_image(img_bytes, filename=image.filename or "image.png")
 
         try:
             obj = json.loads(raw_text)
         except Exception:
             obj = extract_json(raw_text)
 
+        # Harden response shape (prevents ResponseValidationError 500)
         if "primary" not in obj or not isinstance(obj["primary"], dict):
             raise ValueError("Missing or invalid 'primary' in model JSON")
 
@@ -61,30 +64,16 @@ async def identify(image: UploadFile = File(...)):
         return obj
 
     except GeminiRateLimitError as e:
-        # Return 429 (NOT 422), and include Retry-After when we have it.
-        detail = {
-            "error": "rate_limited",
-            "message": e.message,
-            "retry_after_seconds": e.retry_after_seconds,
-        }
-        headers = {}
-        if e.retry_after_seconds is not None:
-            headers["Retry-After"] = str(e.retry_after_seconds)
-        raise HTTPException(status_code=429, detail=detail, headers=headers)
-
-    except GeminiRequestError as e:
-        # Non-429 Gemini errors become 422 (bad upstream / config / parse)
+        # Proper HTTP 429 for iOS to handle cleanly
         raise HTTPException(
-            status_code=422,
+            status_code=429,
             detail={
-                "error": "gemini_error",
-                "message": e.message,
-                "status_code": e.status_code,
-                "body": e.body,
+                "error": "rate_limited",
+                "message": str(e),
+                "retry_after_seconds": e.retry_after_seconds,
                 "raw_model_output": raw_text,
             },
         )
 
     except Exception as e:
-        # Your previous behavior: always return JSON error (422), not a 500
         raise HTTPException(status_code=422, detail=f"{e}\n\nRAW:\n{raw_text}")
