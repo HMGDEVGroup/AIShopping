@@ -12,10 +12,6 @@ router = APIRouter(prefix="/v1", tags=["offers"])
 
 
 def _parse_price_value(price: Optional[str]) -> Optional[float]:
-    """
-    Converts strings like "$599.99", "From $499.99", "$1,402.58" to float.
-    Returns None if not parseable.
-    """
     if not price:
         return None
     s = str(price)
@@ -30,10 +26,6 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
 
 
 def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
-    """
-    SerpApi sometimes provides numeric extracted prices in different keys.
-    Prefer those first, then fall back to parsing r["price"].
-    """
     price_str = r.get("price")
     price_val = None
 
@@ -72,9 +64,6 @@ def _key_for_dedupe(o: OfferItem) -> str:
 
 
 def _iter_json_objects(obj: Any) -> List[dict]:
-    """
-    Flatten nested JSON / JSON-LD objects into a list of dicts.
-    """
     out: List[dict] = []
     if isinstance(obj, dict):
         out.append(obj)
@@ -87,26 +76,19 @@ def _iter_json_objects(obj: Any) -> List[dict]:
 
 
 def _plausible_price(x: float) -> bool:
-    # Keep it sane so we don't accidentally grab weights/ids/etc.
     return 10.0 <= x <= 20000.0
 
 
 def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
-    """
-    Extract price from JSON-LD scripts if present.
-    Looks for offers.price or direct price fields.
-    """
     scripts = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
         re.DOTALL | re.IGNORECASE,
     )
-
     for raw in scripts:
         raw = raw.strip()
         if not raw:
             continue
-
         try:
             data = json.loads(raw)
         except Exception:
@@ -137,10 +119,6 @@ def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
 
 
 def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
-    """
-    Costco often embeds numeric prices without a '$'.
-    Search common key names and parse the first plausible value.
-    """
     keys = [
         "currentPrice",
         "finalPrice",
@@ -152,7 +130,6 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
         "amount",
     ]
 
-    # Pattern 1: "key": 499.99  OR "key":"499.99"
     for k in keys:
         pat = rf'"{re.escape(k)}"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
         m = re.search(pat, html, re.IGNORECASE)
@@ -164,7 +141,6 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
             except Exception:
                 pass
 
-    # Pattern 2: "key": {"value": 499.99}
     for k in keys:
         pat = rf'"{re.escape(k)}"\s*:\s*\{{[^}}]*"value"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
         m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
@@ -182,10 +158,7 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
 async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]:
     """
     Best-effort Costco price extraction.
-    Tries:
-      1) JSON-LD offers.price
-      2) Embedded JSON numeric patterns ("price": 499.99 etc.)
-      3) Classic "$499.99" HTML scan
+    NOTE: Costco often blocks bots or renders price via JS, so this can still return None.
     """
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -203,17 +176,14 @@ async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]
                 return None, None
             html = r.text
 
-        # 1) JSON-LD
         pv = _try_extract_price_from_ld_json(html)
         if pv is not None:
             return f"${pv:,.2f}", pv
 
-        # 2) Embedded JSON patterns
         pv2 = _try_extract_price_from_json_patterns(html)
         if pv2 is not None:
             return f"${pv2:,.2f}", pv2
 
-        # 3) Simple $ scan
         m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
         if m:
             price_str = f"${m.group(1)}"
@@ -222,15 +192,57 @@ async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]
                 return price_str, price_val
 
         return None, None
-
     except Exception:
         return None, None
 
 
+async def _costco_from_serpapi_shopping(q: str, gl: str, hl: str) -> Optional[OfferItem]:
+    """
+    Reliable Costco price: ask SerpApi Google Shopping with 'Costco' in the query.
+    This is MUCH more reliable than scraping Costco.com.
+    """
+    raw = await shopping_search(
+        q=f"{q} Costco",
+        gl=gl,
+        hl=hl,
+        num=50,
+        no_cache=True,
+    )
+
+    results = raw.get("shopping_results", []) or []
+    for r in results:
+        src = (_extract_source(r) or "").lower()
+        if "costco" in src:
+            price_str, price_val = _extract_price_fields(r)
+            if price_val is not None:
+                return OfferItem(
+                    title=r.get("title", "Costco offer"),
+                    price=price_str,
+                    price_value=price_val,
+                    source=_extract_source(r) or "Costco",
+                    link=_extract_link(r),
+                    thumbnail=r.get("thumbnail"),
+                    delivery=r.get("delivery"),
+                    rating=r.get("rating"),
+                    reviews=r.get("reviews"),
+                )
+
+    return None
+
+
 async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem]:
     """
-    Finds a Costco product page via web search and attempts to scrape price.
+    Costco fallback strategy:
+      1) Try SerpApi Google Shopping for Costco price (reliable)
+      2) If not found, use Google web search to get Costco product page + try scrape (best-effort)
+      3) If scrape fails, still return Costco link with null price (membership indicator)
     """
+    # 1) Best path: SerpApi shopping Costco entry with price
+    from_shopping = await _costco_from_serpapi_shopping(q=q, gl=gl, hl=hl)
+    if from_shopping:
+        return from_shopping
+
+    # 2) Web search for Costco product page
     web_q = f"site:costco.com {q}"
     raw = await google_search(q=web_q, gl=gl, hl=hl, num=10, no_cache=True)
 
@@ -245,6 +257,7 @@ async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem
     if not costco_url:
         return None
 
+    # 3) Try scrape (may still return None if blocked/JS)
     price_str, price_val = await _fetch_costco_price(costco_url)
 
     return OfferItem(
@@ -270,7 +283,7 @@ async def offers(
 ):
     """
     Returns offers sorted by best (lowest) parsed price first.
-    Also attempts a Costco fallback (web search + page parse) when include_membership=true.
+    Also attempts a Costco fallback when include_membership=true.
     """
     try:
         base_raw = await shopping_search(
