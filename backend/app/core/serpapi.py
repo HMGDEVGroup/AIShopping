@@ -74,3 +74,55 @@ async def google_search(
         params["no_cache"] = _bool_param(True)
 
     return await _serpapi_request(params)
+
+
+# ---------------------------
+# Convenience wrappers
+# ---------------------------
+
+async def shopping_search(
+    q: str,
+    gl: str = "us",
+    hl: str = "en",
+    num: int = 10,
+    no_cache: bool = False,
+) -> Dict[str, Any]:
+    """
+    Google Shopping results via SerpApi.
+    Returns payload containing 'shopping_results' when available.
+    """
+    params: Dict[str, Any] = {
+        "engine": "google_shopping",
+        "q": q,
+        "gl": gl,
+        "hl": hl,
+        "num": max(1, min(int(num), 100)),
+    }
+    if no_cache:
+        params["no_cache"] = _bool_param(True)
+
+    return await _serpapi_request(params)
+
+
+async def google_search(
+    q: str,
+    gl: str = "us",
+    hl: str = "en",
+    num: int = 10,
+    no_cache: bool = False,
+) -> Dict[str, Any]:
+    """
+    Standard Google web results via SerpApi.
+    Returns payload containing 'organic_results' when available.
+    """
+    params: Dict[str, Any] = {
+        "engine": "google",
+        "q": q,
+        "gl": gl,
+        "hl": hl,
+        "num": max(1, min(int(num), 100)),
+    }
+    if no_cache:
+        params["no_cache"] = _bool_param(True)
+
+    return await _serpapi_request(params)

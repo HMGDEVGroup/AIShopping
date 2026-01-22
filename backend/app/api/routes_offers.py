@@ -12,6 +12,10 @@ router = APIRouter(prefix="/v1", tags=["offers"])
 
 
 def _parse_price_value(price: Optional[str]) -> Optional[float]:
+    """
+    Converts strings like "$599.99", "From $499.99", "$1,402.58" to float.
+    Returns None if not parseable.
+    """
     if not price:
         return None
     s = str(price)
@@ -27,9 +31,7 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
 
 def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
     """
-    SerpApi may return:
-      - price: "$599.99"
-      - extracted_price / price_extracted: 599.99
+    Best-effort: use any numeric extracted price SerpApi provides, otherwise parse price string.
     """
     price_str = r.get("price")
     price_val = None
@@ -69,6 +71,9 @@ def _key_for_dedupe(o: OfferItem) -> str:
 
 
 def _iter_json_objects(obj: Any) -> List[dict]:
+    """
+    Flatten nested JSON-LD / JSON objects into a list of dicts.
+    """
     out: List[dict] = []
     if isinstance(obj, dict):
         out.append(obj)
@@ -81,10 +86,15 @@ def _iter_json_objects(obj: Any) -> List[dict]:
 
 
 def _plausible_price(x: float) -> bool:
+    # Keep it sane so we don't accidentally grab weights/ids/etc.
     return 10.0 <= x <= 20000.0
 
 
 def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
+    """
+    Extract price from JSON-LD scripts if present.
+    Looks for offers.price or price fields.
+    """
     scripts = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
@@ -123,7 +133,34 @@ def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
     return None
 
 
+def _try_extract_price_from_meta(html: str) -> Optional[float]:
+    """
+    Try common meta tag patterns:
+      <meta itemprop="price" content="499.99">
+      <meta property="product:price:amount" content="499.99">
+    """
+    meta_patterns = [
+        r'<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']price["\'][^>]+content=["\']([^"\']+)["\']',
+    ]
+    for pat in meta_patterns:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            try:
+                pv = float(str(m.group(1)).replace(",", "").strip())
+                if _plausible_price(pv):
+                    return pv
+            except Exception:
+                pass
+    return None
+
+
 def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
+    """
+    Search embedded JSON for numeric prices (best-effort).
+    Note: Costco often loads pricing via JS/XHR; may still be absent.
+    """
     keys = [
         "currentPrice",
         "finalPrice",
@@ -135,7 +172,7 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
         "amount",
     ]
 
-    # "key": 499.99 OR "key":"499.99"
+    # Pattern 1: "key": 499.99  OR "key":"499.99"
     for k in keys:
         pat = rf'"{re.escape(k)}"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
         m = re.search(pat, html, re.IGNORECASE)
@@ -147,7 +184,7 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
             except Exception:
                 pass
 
-    # "key": {"value": 499.99}
+    # Pattern 2: "key": {"value": 499.99}
     for k in keys:
         pat = rf'"{re.escape(k)}"\s*:\s*\{{[^}}]*"value"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
         m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
@@ -162,73 +199,97 @@ def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
     return None
 
 
-async def _download_html(url: str) -> Optional[str]:
-    """
-    1) Try direct fetch (often blocked by Costco)
-    2) If blocked/non-200, fallback to a readable proxy fetch that returns the HTML.
-       Proxy used: r.jina.ai (very reliable for blocked sites).
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        try:
-            r = await client.get(url, headers=headers)
-            if r.status_code == 200 and r.text and len(r.text) > 2000:
-                return r.text
-        except Exception:
-            pass
-
-        # Fallback: proxy
-        try:
-            # r.jina.ai expects "https://r.jina.ai/http(s)://..."
-            proxied = "https://r.jina.ai/" + url
-            r2 = await client.get(proxied, headers=headers)
-            if r2.status_code == 200 and r2.text and len(r2.text) > 2000:
-                return r2.text
-        except Exception:
-            pass
-
-    return None
-
-
 async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]:
-    html = await _download_html(url)
-    if not html:
+    """
+    Best-effort Costco price extraction.
+    Tries:
+      1) JSON-LD offers.price
+      2) meta tags (itemprop/property)
+      3) embedded JSON numeric patterns
+      4) classic "$499.99" HTML scan
+
+    NOTE: Costco often loads price dynamically or gates it by location/membership,
+    so price may legitimately not exist in the raw HTML.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
+            if r.status_code != 200:
+                return None, None
+            html = r.text
+
+        pv = _try_extract_price_from_ld_json(html)
+        if pv is not None:
+            return f"${pv:,.2f}", pv
+
+        pv = _try_extract_price_from_meta(html)
+        if pv is not None:
+            return f"${pv:,.2f}", pv
+
+        pv = _try_extract_price_from_json_patterns(html)
+        if pv is not None:
+            return f"${pv:,.2f}", pv
+
+        m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
+        if m:
+            price_str = f"${m.group(1)}"
+            price_val = _parse_price_value(price_str)
+            if price_val is not None and _plausible_price(price_val):
+                return price_str, price_val
+
+        return None, None
+    except Exception:
         return None, None
 
-    pv = _try_extract_price_from_ld_json(html)
-    if pv is not None:
-        return f"${pv:,.2f}", pv
 
-    pv2 = _try_extract_price_from_json_patterns(html)
-    if pv2 is not None:
-        return f"${pv2:,.2f}", pv2
-
-    m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
-    if m:
-        price_str = f"${m.group(1)}"
-        price_val = _parse_price_value(price_str)
-        if price_val is not None and _plausible_price(price_val):
-            return price_str, price_val
-
-    return None, None
+def _extract_rating_reviews_from_organic(r: dict) -> Tuple[Optional[float], Optional[int]]:
+    """
+    SerpApi organic result sometimes contains:
+      r["rich_snippet"]["bottom"]["detected_extensions"]["rating"]
+      r["rich_snippet"]["bottom"]["detected_extensions"]["reviews"]
+    """
+    try:
+        rs = r.get("rich_snippet") or {}
+        bottom = rs.get("bottom") or {}
+        det = bottom.get("detected_extensions") or {}
+        rating = det.get("rating")
+        reviews = det.get("reviews")
+        if rating is not None and not isinstance(rating, (int, float)):
+            rating = None
+        if reviews is not None and not isinstance(reviews, int):
+            try:
+                reviews = int(reviews)
+            except Exception:
+                reviews = None
+        return (float(rating) if isinstance(rating, (int, float)) else None, reviews)
+    except Exception:
+        return (None, None)
 
 
 async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem]:
+    """
+    Find a Costco product page via SerpApi web search, then best-effort scrape price.
+    Even if price can't be extracted, we still return the Costco link + rating/reviews if present.
+    """
     web_q = f"site:costco.com {q}"
     raw = await google_search(q=web_q, gl=gl, hl=hl, num=10, no_cache=True)
 
     organic = raw.get("organic_results", []) or []
+    costco_result = None
     costco_url = None
     for r in organic:
         link = r.get("link")
         if isinstance(link, str) and "costco.com" in link:
+            costco_result = r
             costco_url = link
             break
 
@@ -236,19 +297,7 @@ async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem
         return None
 
     price_str, price_val = await _fetch_costco_price(costco_url)
-
-    # Also pull rating/reviews if present in SerpApi rich_snippet
-    rating = None
-    reviews = None
-    try:
-        rs = (r.get("rich_snippet") or {}).get("bottom") or {}
-        det = rs.get("detected_extensions") or {}
-        if isinstance(det.get("rating"), (int, float)):
-            rating = float(det["rating"])
-        if isinstance(det.get("reviews"), int):
-            reviews = det["reviews"]
-    except Exception:
-        pass
+    rating, reviews = _extract_rating_reviews_from_organic(costco_result or {})
 
     return OfferItem(
         title="Costco (membership) - product page",
@@ -276,6 +325,7 @@ async def offers(
     Also attempts a Costco fallback (web search + page parse) when include_membership=true.
     """
     try:
+        # Pull extra results so we have room to sort/dedupe before slicing
         base_raw = await shopping_search(
             q=q,
             gl=gl,
@@ -302,16 +352,6 @@ async def offers(
                 )
             )
 
-        # If SerpApi returned a Costco offer but without price, attempt to enrich it
-        if include_membership:
-            for i, o in enumerate(list(offers_list)):
-                if (o.source or "").lower().strip() == "costco" and o.link and o.price_value is None:
-                    pstr, pval = await _fetch_costco_price(o.link)
-                    if pval is not None:
-                        offers_list[i].price = pstr
-                        offers_list[i].price_value = pval
-
-        # If still no Costco entry at all, add a Costco fallback
         if include_membership:
             has_costco = any("costco" in (o.source or "").lower() for o in offers_list)
             if not has_costco:
@@ -319,7 +359,7 @@ async def offers(
                 if costco_offer:
                     offers_list.append(costco_offer)
 
-        # Dedupe (keep the one with a price if duplicates exist)
+        # Dedupe: prefer an entry with a real numeric price_value if duplicates
         deduped: Dict[str, OfferItem] = {}
         for o in offers_list:
             k = _key_for_dedupe(o)
@@ -332,6 +372,7 @@ async def offers(
 
         offers_list = list(deduped.values())
 
+        # Sort cheapest first (None prices go to end)
         offers_list.sort(
             key=lambda o: (
                 o.price_value is None,
@@ -339,6 +380,7 @@ async def offers(
             )
         )
 
+        # Apply num after sorting (cap to 1..50)
         n = max(1, min(int(num), 50))
         offers_list = offers_list[:n]
 
