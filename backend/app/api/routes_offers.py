@@ -1,27 +1,22 @@
 import re
 from typing import Optional, Tuple, Dict
 
+import httpx
 from fastapi import APIRouter, HTTPException
 
-from app.core.serpapi import shopping_search
+from app.core.serpapi import shopping_search, google_search
 from app.schemas.offers import OffersResponse, OfferItem
 
 router = APIRouter(prefix="/v1", tags=["offers"])
 
 
 def _parse_price_value(price: Optional[str]) -> Optional[float]:
-    """
-    Converts strings like "$599.99", "From $499.99", "$1,402.58" to float.
-    Returns None if not parseable.
-    """
     if not price:
         return None
-
     s = str(price)
     m = re.search(r"(\d[\d,]*\.?\d*)", s)
     if not m:
         return None
-
     num = m.group(1).replace(",", "")
     try:
         return float(num)
@@ -30,12 +25,6 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
 
 
 def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
-    """
-    SerpAPI may provide:
-      - price: "$599.99"
-      - extracted_price OR price_extracted: 599.99 (numeric)
-    We prefer numeric when present.
-    """
     price_str = r.get("price")
     price_val = None
 
@@ -52,9 +41,6 @@ def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
 
 
 def _extract_link(r: dict) -> Optional[str]:
-    """
-    SerpAPI field names vary; try common ones.
-    """
     for k in ("link", "product_link", "productLink", "merchant_link"):
         v = r.get(k)
         if isinstance(v, str) and v.strip():
@@ -76,6 +62,61 @@ def _key_for_dedupe(o: OfferItem) -> str:
     return f"title::{(o.title or '').strip().lower()}::src::{(o.source or '').strip().lower()}"
 
 
+async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]:
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            if r.status_code != 200:
+                return None, None
+            html = r.text
+
+        m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
+        if not m:
+            return None, None
+
+        price_str = f"${m.group(1)}"
+        price_val = _parse_price_value(price_str)
+        return price_str, price_val
+    except Exception:
+        return None, None
+
+
+async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem]:
+    web_q = f"site:costco.com {q}"
+    raw = await google_search(q=web_q, gl=gl, hl=hl, num=10, no_cache=True)
+
+    organic = raw.get("organic_results", []) or []
+    costco_url = None
+    for r in organic:
+        link = r.get("link")
+        if isinstance(link, str) and "costco.com" in link:
+            costco_url = link
+            break
+
+    if not costco_url:
+        return None
+
+    price_str, price_val = await _fetch_costco_price(costco_url)
+
+    return OfferItem(
+        title="Costco (membership) - product page",
+        price=price_str,
+        price_value=price_val,
+        source="Costco",
+        link=costco_url,
+        thumbnail=None,
+        delivery=None,
+        rating=None,
+        reviews=None,
+    )
+
+
 @router.get("/offers", response_model=OffersResponse)
 async def offers(
     q: str,
@@ -84,13 +125,14 @@ async def offers(
     hl: str = "en",
     include_membership: bool = True,
 ):
-    """
-    Returns offers sorted by best (lowest) parsed price first.
-    If include_membership is true, we attempt a Costco-boosted query if Costco
-    is not present in the initial results.
-    """
     try:
-        base_raw = await shopping_search(q=q, gl=gl, hl=hl, num=max(20, min(int(num) * 3, 100)), no_cache=True)
+        base_raw = await shopping_search(
+            q=q,
+            gl=gl,
+            hl=hl,
+            num=max(20, min(int(num) * 3, 100)),
+            no_cache=True,
+        )
         base_results = base_raw.get("shopping_results", []) or []
 
         offers_list = []
@@ -111,31 +153,11 @@ async def offers(
             )
 
         if include_membership:
-            has_costco = any((o.source or "").lower().find("costco") >= 0 for o in offers_list)
+            has_costco = any("costco" in (o.source or "").lower() for o in offers_list)
             if not has_costco:
-                costco_raw = await shopping_search(
-                    q=f"{q} Costco",
-                    gl=gl,
-                    hl=hl,
-                    num=max(20, min(int(num) * 3, 100)),
-                    no_cache=True,
-                )
-                costco_results = costco_raw.get("shopping_results", []) or []
-                for r in costco_results:
-                    price_str, price_val = _extract_price_fields(r)
-                    offers_list.append(
-                        OfferItem(
-                            title=r.get("title", "Unknown"),
-                            price=price_str,
-                            price_value=price_val,
-                            source=_extract_source(r),
-                            link=_extract_link(r),
-                            thumbnail=r.get("thumbnail"),
-                            delivery=r.get("delivery"),
-                            rating=r.get("rating"),
-                            reviews=r.get("reviews"),
-                        )
-                    )
+                costco_offer = await _costco_fallback_offer(q=q, gl=gl, hl=hl)
+                if costco_offer:
+                    offers_list.append(costco_offer)
 
         deduped: Dict[str, OfferItem] = {}
         for o in offers_list:
