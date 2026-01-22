@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import json
 import os
+import random
 import re
 from typing import Any, Dict, Optional
 
@@ -11,9 +13,23 @@ from app.core.config import settings
 # Service endpoint for Gemini API (v1beta)
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+# Retry behavior for 429/503
+MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "5"))
+MAX_BACKOFF_SECONDS = float(os.environ.get("GEMINI_MAX_BACKOFF_SECONDS", "20"))
+
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
+
+
+def _redact_key(s: str) -> str:
+    """
+    Redact 'key=...' in URLs or text so we never leak API keys in logs/responses.
+    """
+    if not s:
+        return s
+    # Replace key=XXXXX (until & or whitespace)
+    return re.sub(r"(key=)([^&\s]+)", r"\1REDACTED", s)
 
 
 def _identify_schema() -> Dict[str, Any]:
@@ -72,13 +88,89 @@ def _extract_json_best_effort(text: str) -> Dict[str, Any]:
     return json.loads(m.group(0))
 
 
+async def _sleep_for_retry(resp: httpx.Response, attempt: int) -> None:
+    """
+    Respect Retry-After header when present; otherwise exponential backoff with jitter.
+    """
+    retry_after = resp.headers.get("retry-after")
+    if retry_after:
+        try:
+            wait = float(retry_after)
+            wait = max(0.5, min(wait, MAX_BACKOFF_SECONDS))
+            await asyncio.sleep(wait)
+            return
+        except Exception:
+            pass
+
+    # Exponential backoff with jitter
+    base = min(MAX_BACKOFF_SECONDS, (2 ** attempt))
+    jitter = random.uniform(0.0, 0.5)
+    await asyncio.sleep(base + jitter)
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    json_payload: Dict[str, Any],
+    max_retries: int = MAX_RETRIES,
+) -> httpx.Response:
+    """
+    POST with retries for 429/503.
+    """
+    last_resp: Optional[httpx.Response] = None
+
+    for attempt in range(max_retries + 1):
+        resp = await client.post(url, params=params, json=json_payload)
+        last_resp = resp
+
+        if resp.status_code in (429, 503):
+            # If we still have retries left, back off and try again
+            if attempt < max_retries:
+                await _sleep_for_retry(resp, attempt)
+                continue
+
+        return resp
+
+    # Should never hit here, but just in case:
+    return last_resp  # type: ignore[return-value]
+
+
+async def _get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    max_retries: int = MAX_RETRIES,
+) -> httpx.Response:
+    """
+    GET with retries for 429/503.
+    """
+    last_resp: Optional[httpx.Response] = None
+
+    for attempt in range(max_retries + 1):
+        resp = await client.get(url, params=params)
+        last_resp = resp
+
+        if resp.status_code in (429, 503):
+            if attempt < max_retries:
+                await _sleep_for_retry(resp, attempt)
+                continue
+
+        return resp
+
+    return last_resp  # type: ignore[return-value]
+
+
 async def _list_models(client: httpx.AsyncClient, api_key: str) -> Dict[str, Any]:
     """
     Calls GET /v1beta/models (ListModels).
     """
     url = f"{API_BASE}/models"
-    r = await client.get(url, params={"key": api_key})
-    r.raise_for_status()
+    r = await _get_with_retry(client, url, params={"key": api_key})
+    if r.status_code >= 400:
+        raise ValueError(f"Gemini ListModels failed: {r.status_code}\nBODY:\n{_redact_key(r.text)[:2000]}")
     return r.json()
 
 
@@ -103,7 +195,7 @@ def _pick_model_from_list(models_payload: Dict[str, Any]) -> str:
     chosen = (flash[0] if flash else candidates[0]).get("name")
     if not chosen:
         raise ValueError("ListModels returned a model entry without a name")
-    return chosen  # e.g. "models/gemini-1.5-flash-xxxx"
+    return chosen  # e.g. "models/gemini-2.5-flash"
 
 
 async def _resolve_model_name(api_key: str) -> str:
@@ -132,10 +224,11 @@ async def _resolve_model_name(api_key: str) -> str:
                 "contents": [{"role": "user", "parts": [{"text": "Return ONLY JSON: {\"ok\":true}"}]}],
                 "generationConfig": {"response_mime_type": "application/json", "temperature": 0},
             }
-            r = await client.post(test_url, params={"key": api_key}, json=test_payload)
+            r = await _post_with_retry(client, test_url, params={"key": api_key}, json_payload=test_payload)
             if r.status_code != 404:
-                # Any non-404 here means the model path exists (even if auth/quota later changes).
-                r.raise_for_status()
+                # Any non-404 means model path exists (even if rate limits happen later).
+                if r.status_code >= 400:
+                    raise ValueError(f"Gemini model test failed: {r.status_code}\nBODY:\n{_redact_key(r.text)[:2000]}")
                 return configured
 
         # Otherwise pick from ListModels
@@ -145,18 +238,18 @@ async def _resolve_model_name(api_key: str) -> str:
 
 async def identify_from_image(image_bytes: bytes) -> str:
     """
-    Sends an image to Gemini and returns a CLEAN JSON STRING (json.dumps of validated dict).
+    Sends an image to Gemini and returns a CLEAN JSON STRING.
 
     - Uses Structured Output (response_mime_type + response_json_schema)
-    - Auto-resolves a valid model via ListModels if your hardcoded model is invalid
-    - Validates & normalizes JSON before returning
-    - If the model still returns messy output, we do best-effort extraction + normalization
+    - Auto-resolves a valid model via ListModels if your configured model is invalid
+    - Retries 429/503 with backoff
+    - Redacts API key from any raised errors
     """
     api_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set")
 
-    model_name = await _resolve_model_name(api_key)  # e.g. "models/...."
+    model_name = await _resolve_model_name(api_key)  # e.g. "models/gemini-2.5-flash"
     url = f"{API_BASE}/{model_name}:generateContent"
 
     prompt = (
@@ -188,26 +281,25 @@ async def identify_from_image(image_bytes: bytes) -> str:
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, params={"key": api_key}, json=payload)
-        # If the chosen model suddenly fails with 404 (rare), re-resolve once
+        r = await _post_with_retry(client, url, params={"key": api_key}, json_payload=payload)
+
+        # If the chosen model suddenly fails with 404 (rare), re-resolve once and try again
         if r.status_code == 404:
             model_name = await _resolve_model_name(api_key)
             url = f"{API_BASE}/{model_name}:generateContent"
-            r = await client.post(url, params={"key": api_key}, json=payload)
+            r = await _post_with_retry(client, url, params={"key": api_key}, json_payload=payload)
 
-        try:
-            r.raise_for_status()
-        except Exception:
-            raise ValueError(f"Gemini request failed: {r.status_code}\nBODY:\n{r.text}")
+        if r.status_code >= 400:
+            safe_url = _redact_key(str(r.request.url))
+            safe_body = _redact_key(r.text)[:2000]
+            raise ValueError(f"Gemini request failed: {r.status_code}\nURL:\n{safe_url}\nBODY:\n{safe_body}")
 
         data = r.json()
 
     # Preferred structured output location
-    text: Optional[str] = None
     try:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        # Some responses return structured JSON in different shapes; dump for debugging
         raise ValueError(f"Unexpected Gemini response shape; raw={json.dumps(data)[:2000]}")
 
     # 1) Strict JSON parse first
@@ -217,9 +309,6 @@ async def identify_from_image(image_bytes: bytes) -> str:
     except Exception:
         pass
 
-    # 2) Best-effort extraction (handles fences / extra text)
-    try:
-        obj = _extract_json_best_effort(text)
-        return json.dumps(obj, ensure_ascii=False)
-    except Exception as e:
-        raise ValueError(f"Gemini did not return valid JSON. Error: {e}\nRAW_TEXT:\n{text[:2000]}")
+    # 2) Best-effort extraction
+    obj = _extract_json_best_effort(text)
+    return json.dumps(obj, ensure_ascii=False)
