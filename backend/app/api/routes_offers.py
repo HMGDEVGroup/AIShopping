@@ -18,6 +18,8 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
         return None
 
     s = str(price)
+
+    # Grab the first number-looking token (handles commas)
     m = re.search(r"(\d[\d,]*\.?\d*)", s)
     if not m:
         return None
@@ -41,7 +43,14 @@ async def offers(
     Returns offers sorted by best (lowest) parsed price first.
     """
     try:
-        raw = await shopping_search(q)
+        raw = await shopping_search(
+            q=q,
+            gl=gl,
+            hl=hl,
+            include_membership=include_membership,
+            num=num,
+        )
+
         results = raw.get("shopping_results", []) or []
 
         offers_list = []
