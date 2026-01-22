@@ -1,64 +1,55 @@
-import os
-from typing import Any, Dict
-
 import httpx
+from typing import Any, Dict, Optional
 
 from app.core.config import settings
 
 SERPAPI_BASE = "https://serpapi.com/search.json"
 
 
-def _get_serpapi_key() -> str:
-    key = (getattr(settings, "SERPAPI_API_KEY", "") or "").strip()
-    if not key:
-        key = (os.environ.get("SERPAPI_API_KEY", "") or "").strip()
-    if not key:
+def _bool_param(v: bool) -> str:
+    return "true" if v else "false"
+
+
+async def _serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
+    api_key = (getattr(settings, "SERPAPI_API_KEY", "") or "").strip()
+    if not api_key:
         raise ValueError("SERPAPI_API_KEY is not set")
-    return key
 
-
-async def shopping_search(
-    q: str,
-    gl: str = "us",
-    hl: str = "en",
-    num: int = 20,
-    no_cache: bool = True,
-) -> Dict[str, Any]:
-    """
-    SerpAPI Google Shopping search.
-    """
-    api_key = _get_serpapi_key()
-
-    try:
-        n = max(1, min(int(num), 100))
-    except Exception:
-        n = 20
-
-    params: Dict[str, Any] = {
-        "engine": "google_shopping",
-        "q": q,
-        "api_key": api_key,
-        "gl": gl,
-        "hl": hl,
-        "num": n,
-    }
-
-    if no_cache:
-        params["no_cache"] = "true"
+    params = dict(params)
+    params["api_key"] = api_key
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(SERPAPI_BASE, params=params)
         try:
             r.raise_for_status()
         except Exception:
-            raise ValueError(f"SerpAPI request failed: {r.status_code}\nBODY:\n{r.text}")
+            raise ValueError(f"SerpApi request failed: {r.status_code}\nBODY:\n{r.text}")
 
-        data = r.json()
+        return r.json()
 
-    if isinstance(data, dict) and data.get("error"):
-        raise ValueError(f"SerpAPI error: {data.get('error')}")
 
-    return data
+async def shopping_search(
+    q: str,
+    gl: str = "us",
+    hl: str = "en",
+    num: int = 10,
+    no_cache: bool = False,
+) -> Dict[str, Any]:
+    """
+    Google Shopping results via SerpApi.
+    Returns payload containing 'shopping_results' when available.
+    """
+    params: Dict[str, Any] = {
+        "engine": "google_shopping",
+        "q": q,
+        "gl": gl,
+        "hl": hl,
+        "num": max(1, min(int(num), 100)),
+    }
+    if no_cache:
+        params["no_cache"] = _bool_param(True)
+
+    return await _serpapi_request(params)
 
 
 async def google_search(
@@ -66,40 +57,20 @@ async def google_search(
     gl: str = "us",
     hl: str = "en",
     num: int = 10,
-    no_cache: bool = True,
+    no_cache: bool = False,
 ) -> Dict[str, Any]:
     """
-    SerpAPI Google (web) search (used for Costco fallback).
+    Standard Google web results via SerpApi.
+    Returns payload containing 'organic_results' when available.
     """
-    api_key = _get_serpapi_key()
-
-    try:
-        n = max(1, min(int(num), 100))
-    except Exception:
-        n = 10
-
     params: Dict[str, Any] = {
         "engine": "google",
         "q": q,
-        "api_key": api_key,
         "gl": gl,
         "hl": hl,
-        "num": n,
+        "num": max(1, min(int(num), 100)),
     }
-
     if no_cache:
-        params["no_cache"] = "true"
+        params["no_cache"] = _bool_param(True)
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(SERPAPI_BASE, params=params)
-        try:
-            r.raise_for_status()
-        except Exception:
-            raise ValueError(f"SerpAPI request failed: {r.status_code}\nBODY:\n{r.text}")
-
-        data = r.json()
-
-    if isinstance(data, dict) and data.get("error"):
-        raise ValueError(f"SerpAPI error: {data.get('error')}")
-
-    return data
+    return await _serpapi_request(params)

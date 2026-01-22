@@ -1,5 +1,6 @@
 import re
-from typing import Optional, Tuple, Dict
+import json
+from typing import Optional, Tuple, Dict, Any, List
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -62,27 +63,152 @@ def _key_for_dedupe(o: OfferItem) -> str:
     return f"title::{(o.title or '').strip().lower()}::src::{(o.source or '').strip().lower()}"
 
 
+def _iter_json_objects(obj: Any) -> List[dict]:
+    """
+    Flatten nested JSON-LD objects into a list of dicts.
+    """
+    out: List[dict] = []
+    if isinstance(obj, dict):
+        out.append(obj)
+        for v in obj.values():
+            out.extend(_iter_json_objects(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_iter_json_objects(item))
+    return out
+
+
+def _plausible_price(x: float) -> bool:
+    # Keep it sane so we don't accidentally grab weights/ids/etc.
+    return 10.0 <= x <= 20000.0
+
+
+def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
+    """
+    Extract price from JSON-LD scripts if present.
+    Looks for offers.price or price fields.
+    """
+    scripts = re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    for raw in scripts:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        for d in _iter_json_objects(data):
+            offers = d.get("offers")
+            for candidate in _iter_json_objects(offers):
+                p = candidate.get("price")
+                if p is not None:
+                    try:
+                        pv = float(str(p).replace(",", "").strip())
+                        if _plausible_price(pv):
+                            return pv
+                    except Exception:
+                        pass
+
+            p2 = d.get("price")
+            if p2 is not None:
+                try:
+                    pv = float(str(p2).replace(",", "").strip())
+                    if _plausible_price(pv):
+                        return pv
+                except Exception:
+                    pass
+
+    return None
+
+
+def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
+    """
+    Costco often embeds numeric prices without a '$'.
+    We search common key names and parse the first plausible value.
+    """
+    keys = [
+        "currentPrice",
+        "finalPrice",
+        "salePrice",
+        "regularPrice",
+        "memberPrice",
+        "price",
+        "value",
+        "amount",
+    ]
+
+    # Pattern 1: "key": 499.99  OR "key":"499.99"
+    for k in keys:
+        pat = rf'"{re.escape(k)}"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            try:
+                pv = float(m.group(1).replace(",", ""))
+                if _plausible_price(pv):
+                    return pv
+            except Exception:
+                pass
+
+    # Pattern 2: "key": {"value": 499.99}
+    for k in keys:
+        pat = rf'"{re.escape(k)}"\s*:\s*\{{[^}}]*"value"\s*:\s*"?(\d{{1,5}}(?:,\d{{3}})*\.\d{{2}})"?'
+        m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
+        if m:
+            try:
+                pv = float(m.group(1).replace(",", ""))
+                if _plausible_price(pv):
+                    return pv
+            except Exception:
+                pass
+
+    return None
+
+
 async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Best-effort Costco price extraction.
+    Tries:
+      1) JSON-LD offers.price
+      2) Embedded JSON numeric patterns
+      3) Classic "$499.99" HTML scan
+    """
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             r = await client.get(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "text/html,application/xhtml+xml",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
                 },
             )
             if r.status_code != 200:
                 return None, None
             html = r.text
 
-        m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
-        if not m:
-            return None, None
+        pv = _try_extract_price_from_ld_json(html)
+        if pv is not None:
+            return f"${pv:,.2f}", pv
 
-        price_str = f"${m.group(1)}"
-        price_val = _parse_price_value(price_str)
-        return price_str, price_val
+        pv2 = _try_extract_price_from_json_patterns(html)
+        if pv2 is not None:
+            return f"${pv2:,.2f}", pv2
+
+        m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
+        if m:
+            price_str = f"${m.group(1)}"
+            price_val = _parse_price_value(price_str)
+            if price_val is not None and _plausible_price(price_val):
+                return price_str, price_val
+
+        return None, None
     except Exception:
         return None, None
 
@@ -125,6 +251,10 @@ async def offers(
     hl: str = "en",
     include_membership: bool = True,
 ):
+    """
+    Returns offers sorted by best (lowest) parsed price first.
+    Also attempts a Costco fallback (web search + page parse) when include_membership=true.
+    """
     try:
         base_raw = await shopping_search(
             q=q,
@@ -159,6 +289,7 @@ async def offers(
                 if costco_offer:
                     offers_list.append(costco_offer)
 
+        # Dedupe
         deduped: Dict[str, OfferItem] = {}
         for o in offers_list:
             k = _key_for_dedupe(o)
@@ -171,6 +302,7 @@ async def offers(
 
         offers_list = list(deduped.values())
 
+        # Sort cheapest first (None prices go to end)
         offers_list.sort(
             key=lambda o: (
                 o.price_value is None,
