@@ -16,9 +16,8 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
     """
     if not price:
         return None
-    s = str(price)
 
-    # grab the first number-looking token (handles commas)
+    s = str(price)
     m = re.search(r"(\d[\d,]*\.?\d*)", s)
     if not m:
         return None
@@ -38,15 +37,17 @@ async def offers(
     hl: str = "en",
     include_membership: bool = True,
 ):
+    """
+    Returns offers sorted by best (lowest) parsed price first.
+    """
     try:
         raw = await shopping_search(q)
-
         results = raw.get("shopping_results", []) or []
 
-        offers = []
+        offers_list = []
         for r in results:
             price = r.get("price")
-            offers.append(
+            offers_list.append(
                 OfferItem(
                     title=r.get("title", "Unknown"),
                     price=price,
@@ -61,12 +62,18 @@ async def offers(
             )
 
         # Sort cheapest first (None prices go to the end)
-        offers.sort(key=lambda o: (o.price_value is None, o.price_value if o.price_value is not None else 0.0))
+        offers_list.sort(
+            key=lambda o: (
+                o.price_value is None,
+                o.price_value if o.price_value is not None else 0.0,
+            )
+        )
 
-        # Apply num after sorting (so you truly get the top N cheapest)
-        offers = offers[: max(1, min(num, 50))]
+        # Apply num after sorting (cap to 1..50)
+        n = max(1, min(int(num), 50))
+        offers_list = offers_list[:n]
 
-        return OffersResponse(query=q, offers=offers, raw=None)
+        return OffersResponse(query=q, offers=offers_list, raw=None)
 
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
