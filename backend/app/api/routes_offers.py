@@ -12,6 +12,10 @@ router = APIRouter(prefix="/v1", tags=["offers"])
 
 
 def _parse_price_value(price: Optional[str]) -> Optional[float]:
+    """
+    Converts strings like "$599.99", "From $499.99", "$1,402.58" to float.
+    Returns None if not parseable.
+    """
     if not price:
         return None
     s = str(price)
@@ -26,6 +30,10 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
 
 
 def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
+    """
+    SerpApi sometimes provides numeric extracted prices in different keys.
+    Prefer those first, then fall back to parsing r["price"].
+    """
     price_str = r.get("price")
     price_val = None
 
@@ -65,7 +73,7 @@ def _key_for_dedupe(o: OfferItem) -> str:
 
 def _iter_json_objects(obj: Any) -> List[dict]:
     """
-    Flatten nested JSON-LD objects into a list of dicts.
+    Flatten nested JSON / JSON-LD objects into a list of dicts.
     """
     out: List[dict] = []
     if isinstance(obj, dict):
@@ -86,17 +94,19 @@ def _plausible_price(x: float) -> bool:
 def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
     """
     Extract price from JSON-LD scripts if present.
-    Looks for offers.price or price fields.
+    Looks for offers.price or direct price fields.
     """
     scripts = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html,
         re.DOTALL | re.IGNORECASE,
     )
+
     for raw in scripts:
         raw = raw.strip()
         if not raw:
             continue
+
         try:
             data = json.loads(raw)
         except Exception:
@@ -129,7 +139,7 @@ def _try_extract_price_from_ld_json(html: str) -> Optional[float]:
 def _try_extract_price_from_json_patterns(html: str) -> Optional[float]:
     """
     Costco often embeds numeric prices without a '$'.
-    We search common key names and parse the first plausible value.
+    Search common key names and parse the first plausible value.
     """
     keys = [
         "currentPrice",
@@ -174,7 +184,7 @@ async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]
     Best-effort Costco price extraction.
     Tries:
       1) JSON-LD offers.price
-      2) Embedded JSON numeric patterns
+      2) Embedded JSON numeric patterns ("price": 499.99 etc.)
       3) Classic "$499.99" HTML scan
     """
     try:
@@ -193,14 +203,17 @@ async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]
                 return None, None
             html = r.text
 
+        # 1) JSON-LD
         pv = _try_extract_price_from_ld_json(html)
         if pv is not None:
             return f"${pv:,.2f}", pv
 
+        # 2) Embedded JSON patterns
         pv2 = _try_extract_price_from_json_patterns(html)
         if pv2 is not None:
             return f"${pv2:,.2f}", pv2
 
+        # 3) Simple $ scan
         m = re.search(r"\$\s?(\d[\d,]*\.\d{2})", html)
         if m:
             price_str = f"${m.group(1)}"
@@ -209,11 +222,15 @@ async def _fetch_costco_price(url: str) -> Tuple[Optional[str], Optional[float]]
                 return price_str, price_val
 
         return None, None
+
     except Exception:
         return None, None
 
 
 async def _costco_fallback_offer(q: str, gl: str, hl: str) -> Optional[OfferItem]:
+    """
+    Finds a Costco product page via web search and attempts to scrape price.
+    """
     web_q = f"site:costco.com {q}"
     raw = await google_search(q=web_q, gl=gl, hl=hl, num=10, no_cache=True)
 
@@ -265,7 +282,7 @@ async def offers(
         )
         base_results = base_raw.get("shopping_results", []) or []
 
-        offers_list = []
+        offers_list: List[OfferItem] = []
         for r in base_results:
             price_str, price_val = _extract_price_fields(r)
             offers_list.append(
