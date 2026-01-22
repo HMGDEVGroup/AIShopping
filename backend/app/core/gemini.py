@@ -2,120 +2,151 @@ import base64
 import json
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import httpx
 
 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+
+@dataclass
 class GeminiRateLimitError(Exception):
-    def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
-        super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
+    message: str
+    retry_after_seconds: Optional[int] = None
 
 
-def _get_api_key() -> str:
-    k = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-    if not k:
-        raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable")
-    return k
+@dataclass
+class GeminiRequestError(Exception):
+    message: str
+    status_code: Optional[int] = None
+    body: Optional[str] = None
 
 
-def _redact_api_key(text: str) -> str:
-    k = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-    if not k:
-        return text
-    return text.replace(k, "[REDACTED]")
+def _safe_snippet(s: str, limit: int = 4000) -> str:
+    s = s or ""
+    s = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "REDACTED_API_KEY", s)
+    return s[:limit]
 
 
-def _parse_retry_after_seconds(body_text: str) -> Optional[int]:
+def _extract_retry_after_seconds(resp: httpx.Response, body_text: str) -> Optional[int]:
+    ra = resp.headers.get("retry-after")
+    if ra:
+        try:
+            return int(float(ra.strip()))
+        except Exception:
+            pass
+
+    # Gemini often includes retry info inside JSON error.details as {"retryDelay":"22s"}
     try:
-        obj = json.loads(body_text)
-        err = (obj or {}).get("error") or {}
-        details = err.get("details") or []
+        data = json.loads(body_text or "{}")
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        details = err.get("details", []) if isinstance(err, dict) else []
         for d in details:
-            if isinstance(d, dict) and d.get("@type", "").endswith("RetryInfo"):
-                delay = d.get("retryDelay")
-                if isinstance(delay, str):
-                    m = re.match(r"^\s*(\d+)\s*s\s*$", delay)
-                    if m:
-                        return int(m.group(1))
+            if isinstance(d, dict) and "retryDelay" in d:
+                v = str(d.get("retryDelay")).strip().lower()
+                # formats like "22s"
+                m = re.match(r"(\d+)\s*s", v)
+                if m:
+                    return int(m.group(1))
     except Exception:
         pass
+
     return None
 
 
-def _extract_text_from_gemini_response(obj: Dict[str, Any]) -> str:
-    candidates = obj.get("candidates") or []
-    if not candidates:
-        return ""
-    content = candidates[0].get("content") or {}
-    parts = content.get("parts") or []
-    out = []
-    for p in parts:
-        t = p.get("text")
-        if isinstance(t, str):
-            out.append(t)
-    return "\n".join(out).strip()
+async def identify_from_image(img_bytes: bytes) -> str:
+    """
+    Sends an image to Gemini and returns the model's raw text output.
+    This function does NOT do any "model test call".
+    """
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise GeminiRequestError("GEMINI_API_KEY is not set", status_code=500)
 
+    model = (os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent"
 
-async def identify_from_image(image_bytes: bytes) -> str:
-    api_key = _get_api_key()
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-    prompt = (
-        "You are a product identification assistant.\n"
-        "Return ONLY valid JSON in this exact schema:\n"
-        "{\n"
-        '  "primary": {"brand": null, "name": "...", "model": null, "upc": null, "canonical_query": "...", "confidence": 0.0},\n'
-        '  "candidates": [{"brand": null, "name": "...", "model": null, "upc": null, "canonical_query": "...", "confidence": 0.0}],\n'
-        '  "notes": null\n'
-        "}\n"
-        "Rules:\n"
-        "- JSON only (no backticks, no commentary)\n"
-        "- confidence is 0..1\n"
-        "- candidates may be empty\n"
-    )
+    # IMPORTANT: key is passed via x-goog-api-key header (not query param).  [oai_citation:1‡Google AI for Developers](https://ai.google.dev/api)
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+    }
 
     payload: Dict[str, Any] = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
-                    {"text": prompt},
                     {
                         "inline_data": {
                             "mime_type": "image/png",
-                            "data": base64.b64encode(image_bytes).decode("utf-8"),
+                            "data": b64,
                         }
+                    },
+                    {
+                        "text": (
+                            "Identify the primary product in this image.\n"
+                            "Return ONLY a single JSON object with keys:\n"
+                            "primary: {name, canonical_query, confidence, brand, model, upc}\n"
+                            "candidates: [same shape]\n"
+                            "notes: string|null\n"
+                            "No markdown fences. No extra text."
+                        )
                     },
                 ],
             }
-        ]
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+        },
     }
 
-    timeout = httpx.Timeout(30.0, read=60.0)
+    timeout = httpx.Timeout(60.0)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, json=payload)
+        resp = await client.post(url, headers=headers, json=payload)
 
-    if r.status_code == 429:
-        body_text = _redact_api_key(r.text or "")
-        retry_after = _parse_retry_after_seconds(r.text or "")
-        msg = "Gemini rate limit exceeded (429). Please retry."
-        if body_text.strip():
-            msg = msg + "\nBODY:\n" + body_text
-        raise GeminiRateLimitError(msg, retry_after_seconds=retry_after)
+    body_text = resp.text or ""
 
-    if r.status_code >= 400:
-        body_text = _redact_api_key(r.text or "")
-        raise RuntimeError(f"Gemini request failed: {r.status_code}\nBODY:\n{body_text}")
+    if resp.status_code == 429:
+        retry_after = _extract_retry_after_seconds(resp, body_text)
+        msg = "Gemini quota/rate limit exceeded"
+        raise GeminiRateLimitError(message=msg, retry_after_seconds=retry_after)
 
-    obj = r.json()
-    text = _extract_text_from_gemini_response(obj)
+    if resp.status_code >= 400:
+        # 404 often means wrong model name, or project/key not allowed for that model
+        raise GeminiRequestError(
+            message=f"Gemini request failed: {resp.status_code}",
+            status_code=resp.status_code,
+            body=_safe_snippet(body_text),
+        )
 
-    if not text:
-        raise RuntimeError("Gemini returned no text content")
+    # Expected response shape: candidates[0].content.parts[0].text
+    try:
+        data = resp.json()
+    except Exception:
+        raise GeminiRequestError(
+            message="Gemini response was not JSON",
+            status_code=500,
+            body=_safe_snippet(body_text),
+        )
 
-    return text
+    try:
+        candidates = data.get("candidates") or []
+        content = (candidates[0] or {}).get("content") or {}
+        parts = content.get("parts") or []
+        text = (parts[0] or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Missing text in Gemini response candidates[0].content.parts[0].text")
+        return text
+    except Exception as e:
+        raise GeminiRequestError(
+            message=f"Unexpected Gemini response shape: {e}",
+            status_code=500,
+            body=_safe_snippet(json.dumps(data) if isinstance(data, dict) else str(data)),
+        )
