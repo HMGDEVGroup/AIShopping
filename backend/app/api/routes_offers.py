@@ -1,11 +1,10 @@
 import re
 from typing import Optional, Tuple, List, Dict, Any
-
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.core.serpapi import shopping_search, google_search
+from app.core.serpapi import shopping_search
 from app.schemas.offers import OffersResponse, OfferItem
 
 router = APIRouter(prefix="/v1", tags=["offers"])
@@ -159,6 +158,7 @@ async def offers(
 
     - Pulls offers from Google Shopping (via SerpApi helper)
     - Normalizes fields into OfferItem-compatible dictionaries
+    - Validates each row safely (skips invalid rows instead of 500)
     - If include_membership=true, ensures Costco appears (fallback link if not found)
     """
     try:
@@ -178,8 +178,13 @@ async def offers(
             continue
 
         price_str, price_val = _extract_price_fields(r)
-        source = _normalize_source(r)
+        source = _normalize_source(r) or "Unknown"
         link = _normalize_link(r)
+
+        # If link is missing, skip (common cause of 500 via schema validation)
+        if not link:
+            continue
+
         thumbnail = _extract_thumbnail(r)
 
         delivery = r.get("delivery")
@@ -213,9 +218,34 @@ async def offers(
     if include_membership and not _has_costco(normalized):
         _append_costco_fallback(normalized, q)
 
-    # Convert to OfferItem list (Pydantic will validate)
+    # ✅ SAFETY: Validate each offer individually so one bad row never kills the request
+    valid_items: List[OfferItem] = []
+    for o in normalized:
+        try:
+            valid_items.append(OfferItem.model_validate(o))
+        except Exception:
+            continue
+
+    # If membership requested and everything got filtered out, still show Costco fallback
+    if include_membership and not any((i.source or "").strip().lower() == "costco" for i in valid_items):
+        costco_search_url = f"https://www.costco.com/CatalogSearch?keyword={quote_plus((q or '').strip() or 'product')}"
+        try:
+            valid_items.append(OfferItem.model_validate({
+                "title": "Costco (membership) - search results",
+                "price": None,
+                "price_value": None,
+                "source": "Costco",
+                "link": costco_search_url,
+                "thumbnail": None,
+                "delivery": None,
+                "rating": None,
+                "reviews": None,
+            }))
+        except Exception:
+            pass
+
     return OffersResponse(
         query=q,
-        offers=[OfferItem(**o) for o in normalized],
+        offers=valid_items,
         raw=None,
     )
