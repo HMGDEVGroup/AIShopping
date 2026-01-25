@@ -7,4 +7,6 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = ""
     SERPAPI_API_KEY: str = ""
 
-settings = Settings()
+    APP_VERSION: str = "0.1.0"
+    BUILD_ID: str = "dev"
+
