@@ -1,128 +1,71 @@
-import httpx
+# /Users/hmg/Desktop/AIShopping/backend/app/core/serpapi.py
+
+from __future__ import annotations
+
 from typing import Any, Dict, Optional
+import httpx
 
 from app.core.config import settings
 
-SERPAPI_BASE = "https://serpapi.com/search.json"
+
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 
-def _bool_param(v: bool) -> str:
-    return "true" if v else "false"
-
-
-async def _serpapi_request(params: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = (getattr(settings, "SERPAPI_API_KEY", "") or "").strip()
+async def shopping_search(q: str, num: int = 20) -> Dict[str, Any]:
+    """
+    Google Shopping via SerpAPI.
+    Returns the full SerpAPI JSON response as a dict.
+    """
+    api_key = (settings.SERPAPI_API_KEY or "").strip()
     if not api_key:
-        raise ValueError("SERPAPI_API_KEY is not set")
+        # Keep response shape consistent so callers don't crash
+        return {"error": "SERPAPI_API_KEY is missing"}
 
-    params = dict(params)
-    params["api_key"] = api_key
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(SERPAPI_BASE, params=params)
-        try:
-            r.raise_for_status()
-        except Exception:
-            raise ValueError(f"SerpApi request failed: {r.status_code}\nBODY:\n{r.text}")
-
-        return r.json()
-
-
-async def shopping_search(
-    q: str,
-    gl: str = "us",
-    hl: str = "en",
-    num: int = 10,
-    no_cache: bool = False,
-) -> Dict[str, Any]:
-    """
-    Google Shopping results via SerpApi.
-    Returns payload containing 'shopping_results' when available.
-    """
-    params: Dict[str, Any] = {
+    params = {
         "engine": "google_shopping",
         "q": q,
-        "gl": gl,
-        "hl": hl,
-        "num": max(1, min(int(num), 100)),
+        "api_key": api_key,
+        "num": int(num),
+        "hl": "en",
+        "gl": "us",
     }
-    if no_cache:
-        params["no_cache"] = _bool_param(True)
 
-    return await _serpapi_request(params)
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(SERPAPI_ENDPOINT, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    # If SerpAPI returns an error field, pass it through for debugging
+    if isinstance(data, dict) and data.get("error"):
+        return data
+
+    # Guarantee dict
+    return data if isinstance(data, dict) else {"error": "Invalid SerpAPI response type"}
 
 
-async def google_search(
-    q: str,
-    gl: str = "us",
-    hl: str = "en",
-    num: int = 10,
-    no_cache: bool = False,
-) -> Dict[str, Any]:
+async def google_search(q: str, num: int = 10) -> Dict[str, Any]:
     """
-    Standard Google web results via SerpApi.
-    Returns payload containing 'organic_results' when available.
+    Optional: regular Google results via SerpAPI.
+    Returns full SerpAPI JSON response as dict.
     """
-    params: Dict[str, Any] = {
+    api_key = (settings.SERPAPI_API_KEY or "").strip()
+    if not api_key:
+        return {"error": "SERPAPI_API_KEY is missing"}
+
+    params = {
         "engine": "google",
         "q": q,
-        "gl": gl,
-        "hl": hl,
-        "num": max(1, min(int(num), 100)),
+        "api_key": api_key,
+        "num": int(num),
+        "hl": "en",
+        "gl": "us",
     }
-    if no_cache:
-        params["no_cache"] = _bool_param(True)
 
-    return await _serpapi_request(params)
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(SERPAPI_ENDPOINT, params=params)
+        r.raise_for_status()
+        data = r.json()
 
-
-# ---------------------------
-# Convenience wrappers
-# ---------------------------
-
-async def shopping_search(
-    q: str,
-    gl: str = "us",
-    hl: str = "en",
-    num: int = 10,
-    no_cache: bool = False,
-) -> Dict[str, Any]:
-    """
-    Google Shopping results via SerpApi.
-    Returns payload containing 'shopping_results' when available.
-    """
-    params: Dict[str, Any] = {
-        "engine": "google_shopping",
-        "q": q,
-        "gl": gl,
-        "hl": hl,
-        "num": max(1, min(int(num), 100)),
-    }
-    if no_cache:
-        params["no_cache"] = _bool_param(True)
-
-    return await _serpapi_request(params)
-
-
-async def google_search(
-    q: str,
-    gl: str = "us",
-    hl: str = "en",
-    num: int = 10,
-    no_cache: bool = False,
-) -> Dict[str, Any]:
-    """
-    Standard Google web results via SerpApi.
-    Returns payload containing 'organic_results' when available.
-    """
-    params: Dict[str, Any] = {
-        "engine": "google",
-        "q": q,
-        "gl": gl,
-        "hl": hl,
-        "num": max(1, min(int(num), 100)),
-    }
-    if no_cache:
-        params["no_cache"] = _bool_param(True)
-
-    return await _serpapi_request(params)
+    return data if isinstance(data, dict) else {"error": "Invalid SerpAPI response type"}

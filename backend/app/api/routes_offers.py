@@ -1,11 +1,12 @@
+# /Users/hmg/Desktop/AIShopping/backend/app/api/routes_offers.py
+
 import re
 from typing import Optional, Tuple, List, Dict, Any
-
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.core.serpapi import shopping_search
+from app.core.serpapi import shopping_search, google_search
 from app.schemas.offers import OffersResponse, OfferItem
 
 router = APIRouter(prefix="/v1", tags=["offers"])
@@ -33,7 +34,7 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
         return None
 
 
-def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
+def _extract_price_fields(r: Dict[str, Any]) -> Tuple[Optional[str], Optional[float]]:
     """
     Best-effort: use any numeric extracted price SerpApi provides, otherwise parse price string.
     """
@@ -52,7 +53,7 @@ def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
     return price_str, price_val
 
 
-def _normalize_source(r: dict) -> Optional[str]:
+def _normalize_source(r: Dict[str, Any]) -> Optional[str]:
     """
     SerpApi can provide source/store fields under different keys.
     """
@@ -63,7 +64,7 @@ def _normalize_source(r: dict) -> Optional[str]:
     return None
 
 
-def _normalize_link(r: dict) -> Optional[str]:
+def _normalize_link(r: Dict[str, Any]) -> Optional[str]:
     """
     Offer link may come back under different keys.
     """
@@ -74,7 +75,7 @@ def _normalize_link(r: dict) -> Optional[str]:
     return None
 
 
-def _extract_thumbnail(r: dict) -> Optional[str]:
+def _extract_thumbnail(r: Dict[str, Any]) -> Optional[str]:
     for k in ("thumbnail", "image", "image_url"):
         v = r.get(k)
         if isinstance(v, str) and v.strip():
@@ -82,16 +83,18 @@ def _extract_thumbnail(r: dict) -> Optional[str]:
     return None
 
 
-def _extract_rating_reviews(r: dict) -> Tuple[Optional[float], Optional[int]]:
+def _extract_rating_reviews(r: Dict[str, Any]) -> Tuple[Optional[float], Optional[int]]:
     rating = r.get("rating")
     reviews = r.get("reviews")
 
+    # rating may be string
     if isinstance(rating, str):
         try:
             rating = float(re.findall(r"[\d.]+", rating)[0])
         except Exception:
             rating = None
 
+    # reviews may be string like "123"
     if isinstance(reviews, str):
         try:
             reviews = int(re.findall(r"\d+", reviews.replace(",", ""))[0])
@@ -143,37 +146,46 @@ def _append_costco_fallback(offers: List[Dict[str, Any]], q: str) -> None:
 
 
 # -------------------------------------------------------------------
-# Upstream parsing (defensive)
+# Main endpoint
 # -------------------------------------------------------------------
 
-def _extract_raw_offer_rows(results: Any) -> List[dict]:
+@router.get("/offers", response_model=OffersResponse)
+async def offers(
+    q: str = Query(..., description="Product search query"),
+    num: int = Query(20, ge=1, le=100, description="Number of offers to return"),
+    include_membership: bool = Query(False, description="If true, include membership retailers like Costco"),
+):
     """
-    SerpApi helper may return:
-      - dict with shopping_results
-      - dict with other keys
-      - None / string / unexpected
-    This function NEVER throws; it returns a list.
+    Returns shopping offers for a given query.
+
+    - Pulls offers from Google Shopping (via SerpAPI helper)
+    - Normalizes fields into OfferItem-compatible dictionaries
+    - If include_membership=true, ensures Costco appears (fallback link if not found)
     """
+    try:
+        # ✅ THIS IS THE KEY LINE YOU ASKED FOR:
+        results = await shopping_search(q=q, num=num)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Offers failed: {type(e).__name__}: {e}")
+
+    # Defensive: must be dict
     if not isinstance(results, dict):
-        return []
+        raise HTTPException(status_code=502, detail="Offers failed: invalid upstream response")
 
-    rows = results.get("shopping_results")
-    if isinstance(rows, list):
-        return [r for r in rows if isinstance(r, dict)]
+    # SerpAPI error passthrough (helps debugging)
+    if results.get("error"):
+        raise HTTPException(status_code=502, detail=f"Offers failed: {results.get('error')}")
 
-    rows = results.get("shopping_results_list")
-    if isinstance(rows, list):
-        return [r for r in rows if isinstance(r, dict)]
+    raw_offers = results.get("shopping_results") or results.get("shopping_results_list") or []
+    if not isinstance(raw_offers, list):
+        raw_offers = []
 
-    # Some providers return "organic_results" etc.
-    # We only care about shopping rows here.
-    return []
-
-
-def _normalize_offers(rows: List[dict], limit: int) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
 
-    for r in rows:
+    for r in raw_offers:
+        if not isinstance(r, dict):
+            continue
+
         title = r.get("title") or r.get("name")
         if not title:
             continue
@@ -193,6 +205,10 @@ def _normalize_offers(rows: List[dict], limit: int) -> List[Dict[str, Any]]:
 
         rating, reviews = _extract_rating_reviews(r)
 
+        # Skip entries that cannot route anywhere
+        if not link and not source:
+            continue
+
         normalized.append({
             "title": str(title),
             "price": price_str,
@@ -205,54 +221,21 @@ def _normalize_offers(rows: List[dict], limit: int) -> List[Dict[str, Any]]:
             "reviews": reviews,
         })
 
-        if len(normalized) >= limit:
-            break
+    # Trim to requested amount first (then add Costco if needed)
+    normalized = normalized[:num]
 
-    return normalized
-
-
-# -------------------------------------------------------------------
-# Main endpoint (NEVER 500 on upstream shape issues)
-# -------------------------------------------------------------------
-
-@router.get("/offers", response_model=OffersResponse)
-async def offers(
-    q: str = Query(..., description="Product search query"),
-    num: int = Query(20, ge=1, le=100, description="Number of offers to return"),
-    include_membership: bool = Query(False, description="If true, include membership retailers like Costco"),
-):
-    """
-    Returns shopping offers for a given query.
-
-    Rules:
-    - Do NOT 500 just because upstream returned a weird shape.
-    - Always return a valid OffersResponse.
-    - If include_membership=true, ensure Costco appears (fallback link if not found).
-    """
-    try:
-        results = shopping_search(q=q, num=num)
-    except Exception as e:
-        # upstream call itself failed — degrade gracefully
-        results = None
-
-    rows = _extract_raw_offer_rows(results)
-    normalized = _normalize_offers(rows, limit=num)
-
-    # Always append Costco fallback when requested and Costco isn't present
+    # ✅ Costco membership behavior:
     if include_membership and not _has_costco(normalized):
         _append_costco_fallback(normalized, q)
 
-    # Convert to OfferItem list (Pydantic will validate)
-    # If any row is missing required fields, skip it rather than 500.
-    safe_items: List[OfferItem] = []
-    for o in normalized:
-        try:
-            safe_items.append(OfferItem(**o))
-        except Exception:
-            continue
+    # Convert to OfferItem list (Pydantic validates)
+    try:
+        offer_items = [OfferItem(**o) for o in normalized]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Offers failed: invalid offer item: {type(e).__name__}: {e}")
 
     return OffersResponse(
         query=q,
-        offers=safe_items,
+        offers=offer_items,
         raw=None,
     )

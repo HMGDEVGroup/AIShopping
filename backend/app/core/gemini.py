@@ -1,156 +1,316 @@
-import os
-import json
+import asyncio
 import base64
-from typing import Optional, Any, Dict, Tuple
+import json
+import os
+import random
+import re
+from typing import Any, Dict, Optional
 
 import httpx
 
+from app.core.config import settings
 
-GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "5"))
+MAX_BACKOFF_SECONDS = float(os.environ.get("GEMINI_MAX_BACKOFF_SECONDS", "20"))
 
 
-class GeminiError(Exception):
-    pass
-
-
-class GeminiRateLimitError(GeminiError):
-    def __init__(self, message: str, retry_after_seconds: Optional[int] = None, body: str = ""):
+class GeminiRateLimitError(Exception):
+    def __init__(self, message: str, retry_after: Optional[int] = None):
         super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
-        self.body = body
+        self.retry_after = retry_after
 
 
-class GeminiNotFoundError(GeminiError):
-    def __init__(self, message: str, body: str = ""):
-        super().__init__(message)
-        self.body = body
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
 
 
-def _get_env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+def _redact_key(s: str) -> str:
+    if not s:
+        return s
+    return re.sub(r"(key=)([^&\s]+)", r"\1REDACTED", s)
 
 
-def _guess_mime(filename: str) -> str:
-    fn = (filename or "").lower()
-    if fn.endswith(".png"):
-        return "image/png"
-    if fn.endswith(".jpg") or fn.endswith(".jpeg"):
-        return "image/jpeg"
-    if fn.endswith(".webp"):
-        return "image/webp"
-    return "image/png"
-
-
-def _extract_retry_after_seconds(err_json: Dict[str, Any]) -> Optional[int]:
+def _identify_schema() -> Dict[str, Any]:
     """
-    Gemini quota errors sometimes include:
-      error.details[].retryDelay = "27s"
+    IMPORTANT:
+    For the REST generateContent endpoint, structured output uses:
+      generationConfig.response_mime_type = "application/json"
+      generationConfig.response_schema = <schema>
+    The REST example shows TYPE enums like "OBJECT", "ARRAY", "STRING", "NUMBER".  [oai_citation:1‡Google AI for Developers](https://ai.google.dev/api/generate-content)
     """
+    product_candidate = {
+        "type": "OBJECT",
+        "properties": {
+            "brand": {"type": "STRING", "nullable": True},
+            "name": {"type": "STRING"},
+            "model": {"type": "STRING", "nullable": True},
+            "upc": {"type": "STRING", "nullable": True},
+            "canonical_query": {"type": "STRING"},
+            "confidence": {"type": "NUMBER"},
+        },
+        "required": ["name", "canonical_query", "confidence"],
+    }
+
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "primary": product_candidate,
+            "candidates": {"type": "ARRAY", "items": product_candidate},
+            "notes": {"type": "STRING", "nullable": True},
+        },
+        "required": ["primary", "candidates"],
+    }
+
+
+def _extract_json_best_effort(text: str) -> Dict[str, Any]:
+    """
+    If the model returns extra text or fences, we try to recover JSON.
+    """
+    fenced = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return json.loads(fenced.group(1).strip())
+
+    blocks = re.findall(r"\{.*?\}", text, re.DOTALL)
+    for b in blocks:
+        try:
+            return json.loads(b.strip())
+        except Exception:
+            continue
+
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise ValueError("No JSON object found in model output")
+    return json.loads(m.group(0))
+
+
+def _parse_retry_after_from_body(body_text: str) -> Optional[int]:
+    """
+    Gemini sometimes returns:
+      - JSON details with {"retryDelay":"22s"}
+      - message text like "Please retry in 22.813s."
+    """
+    if not body_text:
+        return None
+
+    # Try JSON "retryDelay": "22s"
     try:
-        details = err_json.get("error", {}).get("details", []) or []
+        j = json.loads(body_text)
+        err = (j or {}).get("error") or {}
+        details = err.get("details") or []
         for d in details:
-            if isinstance(d, dict) and d.get("@type", "").endswith("google.rpc.RetryInfo"):
-                delay = d.get("retryDelay")
-                if isinstance(delay, str) and delay.endswith("s"):
-                    n = delay[:-1]
-                    if n.isdigit():
-                        return int(n)
+            if isinstance(d, dict) and d.get("@type", "").endswith("RetryInfo"):
+                rd = d.get("retryDelay")
+                if isinstance(rd, str):
+                    m = re.search(r"(\d+)", rd)
+                    if m:
+                        return int(m.group(1))
     except Exception:
         pass
+
+    # Try "Please retry in 22.813382766s."
+    m2 = re.search(r"retry in\s+(\d+(?:\.\d+)?)s", body_text, re.IGNORECASE)
+    if m2:
+        try:
+            return int(float(m2.group(1)))
+        except Exception:
+            return None
+
     return None
 
 
-def _parse_gemini_text(resp_json: Dict[str, Any]) -> str:
-    """
-    v1beta generateContent response typically:
-      { candidates: [ { content: { parts: [ { text: "..." } ] } } ] }
-    """
-    candidates = resp_json.get("candidates") or []
+async def _sleep_for_retry(resp: httpx.Response, attempt: int) -> None:
+    ra = resp.headers.get("retry-after")
+    if ra:
+        try:
+            wait = float(ra)
+            wait = max(0.5, min(wait, MAX_BACKOFF_SECONDS))
+            await asyncio.sleep(wait)
+            return
+        except Exception:
+            pass
+
+    base = min(MAX_BACKOFF_SECONDS, (2 ** attempt))
+    jitter = random.uniform(0.0, 0.5)
+    await asyncio.sleep(base + jitter)
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    json_payload: Dict[str, Any],
+    max_retries: int = MAX_RETRIES,
+) -> httpx.Response:
+    last_resp: Optional[httpx.Response] = None
+    for attempt in range(max_retries + 1):
+        resp = await client.post(url, params=params, json=json_payload)
+        last_resp = resp
+
+        # Retry transient 429/503
+        if resp.status_code in (429, 503) and attempt < max_retries:
+            await _sleep_for_retry(resp, attempt)
+            continue
+
+        return resp
+
+    return last_resp  # type: ignore[return-value]
+
+
+async def _get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    max_retries: int = MAX_RETRIES,
+) -> httpx.Response:
+    last_resp: Optional[httpx.Response] = None
+    for attempt in range(max_retries + 1):
+        resp = await client.get(url, params=params)
+        last_resp = resp
+
+        if resp.status_code in (429, 503) and attempt < max_retries:
+            await _sleep_for_retry(resp, attempt)
+            continue
+
+        return resp
+
+    return last_resp  # type: ignore[return-value]
+
+
+async def _list_models(client: httpx.AsyncClient, api_key: str) -> Dict[str, Any]:
+    url = f"{API_BASE}/models"
+    r = await _get_with_retry(client, url, params={"key": api_key})
+
+    if r.status_code == 429:
+        retry_after = _parse_retry_after_from_body(r.text)
+        raise GeminiRateLimitError(
+            f"Gemini ListModels quota/rate limit (429). BODY:\n{_redact_key(r.text)[:2000]}",
+            retry_after=retry_after,
+        )
+
+    if r.status_code >= 400:
+        raise ValueError(f"Gemini ListModels failed: {r.status_code}\nBODY:\n{_redact_key(r.text)[:2000]}")
+
+    return r.json()
+
+
+def _pick_model_from_list(models_payload: Dict[str, Any]) -> str:
+    models = models_payload.get("models", []) or []
+
+    def supports_generate(m: Dict[str, Any]) -> bool:
+        methods = m.get("supportedGenerationMethods") or []
+        return any(str(x).lower() == "generatecontent" for x in methods)
+
+    candidates = [m for m in models if supports_generate(m)]
     if not candidates:
-        return ""
+        raise ValueError("No models found that support generateContent")
 
-    c0 = candidates[0] or {}
-    content = c0.get("content") or {}
-    parts = content.get("parts") or []
-    if not parts:
-        return ""
-
-    p0 = parts[0] or {}
-    txt = p0.get("text")
-    return txt if isinstance(txt, str) else ""
+    # Prefer "flash" if present
+    flash = [m for m in candidates if "flash" in (m.get("name", "").lower())]
+    chosen = (flash[0] if flash else candidates[0]).get("name")
+    if not chosen:
+        raise ValueError("ListModels returned a model entry without a name")
+    return chosen
 
 
-async def identify_from_image(img_bytes: bytes, filename: str = "image.png") -> str:
+async def _resolve_model_name(api_key: str) -> str:
     """
-    Sends image to Gemini and returns model text (expected to be JSON string).
-    NOTE: No 'model test' call happens here.
+    If GEMINI_MODEL is set, we use it directly to save quota/time.
+    Otherwise, we call ListModels and pick a generateContent-capable model.
     """
-    api_key = _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY")
+    configured = (getattr(settings, "GEMINI_MODEL", "") or os.environ.get("GEMINI_MODEL", "")).strip()
+
+    def normalize(name: str) -> str:
+        if not name:
+            return ""
+        return name if name.startswith("models/") else f"models/{name}"
+
+    configured = normalize(configured)
+    if configured:
+        return configured
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        models_payload = await _list_models(client, api_key)
+        return _pick_model_from_list(models_payload)
+
+
+def _raise_for_gemini_error(resp: httpx.Response) -> None:
+    if resp.status_code == 429:
+        retry_after = _parse_retry_after_from_body(resp.text)
+        safe_url = _redact_key(str(resp.request.url))
+        safe_body = _redact_key(resp.text)[:2000]
+        raise GeminiRateLimitError(
+            f"Gemini quota/rate limit (429).\nURL:\n{safe_url}\nBODY:\n{safe_body}",
+            retry_after=retry_after,
+        )
+
+    if resp.status_code >= 400:
+        safe_url = _redact_key(str(resp.request.url))
+        safe_body = _redact_key(resp.text)[:2000]
+        raise ValueError(f"Gemini request failed: {resp.status_code}\nURL:\n{safe_url}\nBODY:\n{safe_body}")
+
+
+async def identify_from_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
+    api_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
     if not api_key:
-        raise GeminiError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY) env var")
+        raise ValueError("GEMINI_API_KEY is not set")
 
-    model = _get_env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    model_name = await _resolve_model_name(api_key)
+    url = f"{API_BASE}/{model_name}:generateContent"
 
-    mime_type = _guess_mime(filename)
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-    prompt = (
-        "Identify the product in the image.\n"
-        "Return ONLY valid JSON with keys:\n"
-        "primary: { name, canonical_query, confidence, brand (optional), model (optional), upc (optional) }\n"
-        "candidates: [same shape]\n"
-        "notes: string|null\n"
-        "No markdown. No code fences. JSON only."
+    system_prompt = (
+        "You are an expert product identifier.\n"
+        "Return ONLY valid JSON matching the provided schema.\n"
+        "No markdown. No code fences. No extra text.\n"
     )
 
-    payload: Dict[str, Any] = {
+    payload = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
-                    {"text": prompt},
-                    {"inline_data": {"mime_type": mime_type, "data": b64}},
+                    {"text": system_prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": _b64(image_bytes),
+                        }
+                    },
                 ],
             }
         ],
-        # Optional: keep responses deterministic-ish
-        "generationConfig": {"temperature": 0.2},
+        "generationConfig": {
+            # REST structured output config  [oai_citation:2‡Google AI for Developers](https://ai.google.dev/api/generate-content)
+            "response_mime_type": "application/json",
+            "response_schema": _identify_schema(),
+            "temperature": 0.2,
+        },
     }
 
-    url = f"{GEMINI_ENDPOINT_BASE}/models/{model}:generateContent"
-
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, params={"key": api_key}, json=payload)
+        r = await _post_with_retry(client, url, params={"key": api_key}, json_payload=payload)
 
-    body_text = r.text or ""
+        # If model path invalid, re-resolve once (ListModels)
+        if r.status_code == 404:
+            model_name = await _resolve_model_name(api_key)
+            url = f"{API_BASE}/{model_name}:generateContent"
+            r = await _post_with_retry(client, url, params={"key": api_key}, json_payload=payload)
 
-    if r.status_code == 429:
-        retry_after = None
-        try:
-            j = r.json()
-            retry_after = _extract_retry_after_seconds(j)
-        except Exception:
-            retry_after = None
-        raise GeminiRateLimitError(
-            message="Gemini quota/rate limit exceeded",
-            retry_after_seconds=retry_after,
-            body=body_text,
-        )
-
-    if r.status_code == 404:
-        raise GeminiNotFoundError(
-            message=f"Gemini model not found (check GEMINI_MODEL='{model}')",
-            body=body_text,
-        )
-
-    if r.status_code >= 400:
-        raise GeminiError(f"Gemini request failed: {r.status_code}\nBODY:\n{body_text}")
+        _raise_for_gemini_error(r)
+        data = r.json()
 
     try:
-        resp_json = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        # If Gemini ever returns non-JSON, surface it
-        raise GeminiError(f"Gemini returned non-JSON response\nBODY:\n{body_text}")
+        raise ValueError(f"Unexpected Gemini response shape; raw={json.dumps(data)[:2000]}")
 
-    return _parse_gemini_text(resp_json)
+    # Gemini returns JSON as a string in .text
+    try:
+        obj = json.loads(text)
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        obj = _extract_json_best_effort(text)
+        return json.dumps(obj, ensure_ascii=False)
