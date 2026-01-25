@@ -1,7 +1,7 @@
-# /Users/hmg/Desktop/AIShopping/backend/app/api/routes_offers.py
-
 import re
+import inspect
 from typing import Optional, Tuple, List, Dict, Any
+
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, HTTPException, Query
@@ -34,7 +34,7 @@ def _parse_price_value(price: Optional[str]) -> Optional[float]:
         return None
 
 
-def _extract_price_fields(r: Dict[str, Any]) -> Tuple[Optional[str], Optional[float]]:
+def _extract_price_fields(r: dict) -> Tuple[Optional[str], Optional[float]]:
     """
     Best-effort: use any numeric extracted price SerpApi provides, otherwise parse price string.
     """
@@ -53,7 +53,7 @@ def _extract_price_fields(r: Dict[str, Any]) -> Tuple[Optional[str], Optional[fl
     return price_str, price_val
 
 
-def _normalize_source(r: Dict[str, Any]) -> Optional[str]:
+def _normalize_source(r: dict) -> Optional[str]:
     """
     SerpApi can provide source/store fields under different keys.
     """
@@ -64,7 +64,7 @@ def _normalize_source(r: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _normalize_link(r: Dict[str, Any]) -> Optional[str]:
+def _normalize_link(r: dict) -> Optional[str]:
     """
     Offer link may come back under different keys.
     """
@@ -75,7 +75,7 @@ def _normalize_link(r: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _extract_thumbnail(r: Dict[str, Any]) -> Optional[str]:
+def _extract_thumbnail(r: dict) -> Optional[str]:
     for k in ("thumbnail", "image", "image_url"):
         v = r.get(k)
         if isinstance(v, str) and v.strip():
@@ -83,18 +83,16 @@ def _extract_thumbnail(r: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _extract_rating_reviews(r: Dict[str, Any]) -> Tuple[Optional[float], Optional[int]]:
+def _extract_rating_reviews(r: dict) -> Tuple[Optional[float], Optional[int]]:
     rating = r.get("rating")
     reviews = r.get("reviews")
 
-    # rating may be string
     if isinstance(rating, str):
         try:
             rating = float(re.findall(r"[\d.]+", rating)[0])
         except Exception:
             rating = None
 
-    # reviews may be string like "123"
     if isinstance(reviews, str):
         try:
             reviews = int(re.findall(r"\d+", reviews.replace(",", ""))[0])
@@ -117,32 +115,203 @@ def _extract_rating_reviews(r: Dict[str, Any]) -> Tuple[Optional[float], Optiona
 
 
 # -------------------------------------------------------------------
-# Costco membership logic (ALWAYS show Costco when requested)
+# Ranking + dedupe
 # -------------------------------------------------------------------
 
-def _has_costco(offers: List[Dict[str, Any]]) -> bool:
-    return any((o.get("source") or "").strip().lower() == "costco" for o in offers)
+def _score_offer(o: Dict[str, Any]) -> float:
+    """
+    Simple scoring heuristic for ranking:
+    - prefers items with price_value
+    - then reviews count
+    - then rating
+    """
+    score = 0.0
+
+    pv = o.get("price_value")
+    if isinstance(pv, (int, float)):
+        score += 50.0
+        # cheaper slightly preferred if all else equal
+        score += max(0.0, 10.0 - min(float(pv) / 200.0, 10.0))
+
+    reviews = o.get("reviews")
+    if isinstance(reviews, int):
+        score += min(30.0, reviews / 50.0)  # caps out
+
+    rating = o.get("rating")
+    if isinstance(rating, (int, float)):
+        score += float(rating) * 3.0
+
+    return score
 
 
-def _append_costco_fallback(offers: List[Dict[str, Any]], q: str) -> None:
+def _dedupe_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    If Costco isn't present in results, add a Costco search link
-    so the iPhone app ALWAYS shows Costco when include_membership=true.
+    De-dupe by link if present, else by (source,title).
+    Keeps the highest scored entry for each key.
     """
+    best: Dict[str, Dict[str, Any]] = {}
+
+    for o in offers:
+        link = (o.get("link") or "").strip()
+        source = (o.get("source") or "").strip().lower()
+        title = (o.get("title") or "").strip().lower()
+
+        if link:
+            key = f"link::{link}"
+        else:
+            key = f"st::{source}::{title}"
+
+        if key not in best:
+            best[key] = o
+        else:
+            if _score_offer(o) > _score_offer(best[key]):
+                best[key] = o
+
+    return list(best.values())
+
+
+# -------------------------------------------------------------------
+# Membership retailer helpers
+# -------------------------------------------------------------------
+
+MEMBERSHIP_TAG = "Member price / Login required"
+
+def _is_costco_source(s: str) -> bool:
+    return s.strip().lower() == "costco"
+
+def _is_sams_source(s: str) -> bool:
+    t = s.strip().lower()
+    return t in ("sam's club", "sams club", "samsclub", "sam’s club")
+
+def _has_retailer(offers: List[Dict[str, Any]], retailer: str) -> bool:
+    retailer_l = retailer.strip().lower()
+    for o in offers:
+        src = (o.get("source") or "").strip().lower()
+        if src == retailer_l:
+            return True
+    return False
+
+
+def _guess_costco_product_url(q: str) -> Optional[str]:
+    """
+    Try to find a real Costco product page via google_search().
+    Returns a product-ish URL if found, else None.
+    """
+    query = f"site:costco.com {q} /p/"
+    try:
+        data = google_search(q=query, num=5)
+    except Exception:
+        return None
+
+    organic = data.get("organic_results") if isinstance(data, dict) else None
+    if not isinstance(organic, list):
+        return None
+
+    for r in organic:
+        if not isinstance(r, dict):
+            continue
+        link = (r.get("link") or "").strip()
+        if not link:
+            continue
+        if "costco.com" in link and "/p/" in link:
+            return link
+    return None
+
+
+def _guess_sams_product_url(q: str) -> Optional[str]:
+    """
+    Try to find a real Sam's Club product page via google_search().
+    Returns a product-ish URL if found, else None.
+    """
+    query = f"site:samsclub.com {q} product"
+    try:
+        data = google_search(q=query, num=5)
+    except Exception:
+        return None
+
+    organic = data.get("organic_results") if isinstance(data, dict) else None
+    if not isinstance(organic, list):
+        return None
+
+    for r in organic:
+        if not isinstance(r, dict):
+            continue
+        link = (r.get("link") or "").strip()
+        if not link:
+            continue
+        if "samsclub.com" in link and ("/p/" in link or "/product/" in link or "/ip/" in link):
+            return link
+    return None
+
+
+def _make_costco_fallback(q: str) -> Dict[str, Any]:
     keyword = (q or "").strip() or "product"
-    costco_search_url = f"https://www.costco.com/CatalogSearch?keyword={quote_plus(keyword)}"
+    product_url = _guess_costco_product_url(keyword)
+    link = product_url or f"https://www.costco.com/CatalogSearch?keyword={quote_plus(keyword)}"
 
-    offers.append({
-        "title": "Costco (membership) - search results",
+    title = "Costco (membership)"
+    if product_url:
+        title += " - product page"
+    else:
+        title += " - search results"
+
+    return {
+        "title": title,
         "price": None,
         "price_value": None,
         "source": "Costco",
-        "link": costco_search_url,
+        "link": link,
         "thumbnail": None,
-        "delivery": None,
+        "delivery": MEMBERSHIP_TAG,
         "rating": None,
         "reviews": None,
-    })
+    }
+
+
+def _make_sams_fallback(q: str) -> Dict[str, Any]:
+    keyword = (q or "").strip() or "product"
+    product_url = _guess_sams_product_url(keyword)
+    link = product_url or f"https://www.samsclub.com/s/{quote_plus(keyword)}"
+
+    title = "Sam's Club (membership)"
+    if product_url:
+        title += " - product page"
+    else:
+        title += " - search results"
+
+    return {
+        "title": title,
+        "price": None,
+        "price_value": None,
+        "source": "Sam's Club",
+        "link": link,
+        "thumbnail": None,
+        "delivery": MEMBERSHIP_TAG,
+        "rating": None,
+        "reviews": None,
+    }
+
+
+def _insert_membership_items(
+    offers: List[Dict[str, Any]],
+    q: str,
+    position: int = 2,   # 0-based; position=2 means show around #3
+) -> List[Dict[str, Any]]:
+    """
+    Ensure membership retailers exist and appear high in the list.
+    Returns a new list (does not mutate original).
+    """
+    out = list(offers)
+
+    if not _has_retailer(out, "costco"):
+        out.insert(min(position, len(out)), _make_costco_fallback(q))
+
+    if not any(_is_sams_source((o.get("source") or "")) for o in out):
+        # place Sam's right after Costco if Costco was inserted, else at same position
+        insert_at = min(position + 1, len(out))
+        out.insert(insert_at, _make_sams_fallback(q))
+
+    return out
 
 
 # -------------------------------------------------------------------
@@ -158,23 +327,19 @@ async def offers(
     """
     Returns shopping offers for a given query.
 
-    - Pulls offers from Google Shopping (via SerpAPI helper)
+    - Pulls offers from Google Shopping (via SerpApi helper)
     - Normalizes fields into OfferItem-compatible dictionaries
-    - If include_membership=true, ensures Costco appears (fallback link if not found)
+    - Dedupe + rank for better results
+    - If include_membership=true, ensures Costco & Sam's appear near the top
     """
     try:
-        # ✅ THIS IS THE KEY LINE YOU ASKED FOR:
-        results = await shopping_search(q=q, num=num)
+        # ✅ REQUIRED: await it if it is async; also supports sync shopping_search safely
+        res = shopping_search(q=q, num=num)
+        results = await res if inspect.isawaitable(res) else res
+        if not isinstance(results, dict):
+            results = {}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Offers failed: {type(e).__name__}: {e}")
-
-    # Defensive: must be dict
-    if not isinstance(results, dict):
-        raise HTTPException(status_code=502, detail="Offers failed: invalid upstream response")
-
-    # SerpAPI error passthrough (helps debugging)
-    if results.get("error"):
-        raise HTTPException(status_code=502, detail=f"Offers failed: {results.get('error')}")
+        raise HTTPException(status_code=500, detail=f"Offers failed: {e}")
 
     raw_offers = results.get("shopping_results") or results.get("shopping_results_list") or []
     if not isinstance(raw_offers, list):
@@ -191,7 +356,7 @@ async def offers(
             continue
 
         price_str, price_val = _extract_price_fields(r)
-        source = _normalize_source(r)
+        source = _normalize_source(r) or ""
         link = _normalize_link(r)
         thumbnail = _extract_thumbnail(r)
 
@@ -205,11 +370,7 @@ async def offers(
 
         rating, reviews = _extract_rating_reviews(r)
 
-        # Skip entries that cannot route anywhere
-        if not link and not source:
-            continue
-
-        normalized.append({
+        item = {
             "title": str(title),
             "price": price_str,
             "price_value": price_val,
@@ -219,23 +380,29 @@ async def offers(
             "delivery": delivery,
             "rating": rating,
             "reviews": reviews,
-        })
+        }
+        normalized.append(item)
 
-    # Trim to requested amount first (then add Costco if needed)
+    # de-dupe
+    normalized = _dedupe_offers(normalized)
+
+    # rank best-to-worst
+    normalized.sort(key=_score_offer, reverse=True)
+
+    # keep up to requested base num BEFORE membership insert
     normalized = normalized[:num]
 
-    # ✅ Costco membership behavior:
-    if include_membership and not _has_costco(normalized):
-        _append_costco_fallback(normalized, q)
+    # ensure membership retailers show up (and show up high)
+    if include_membership:
+        normalized = _insert_membership_items(normalized, q, position=2)
 
-    # Convert to OfferItem list (Pydantic validates)
+        # re-dedupe (in case something overlaps) and keep stable order
+        normalized = _dedupe_offers(normalized)
+
+    # Final: Pydantic validation
     try:
-        offer_items = [OfferItem(**o) for o in normalized]
+        items = [OfferItem(**o) for o in normalized]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Offers failed: invalid offer item: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Offers failed: schema validation error: {e}")
 
-    return OffersResponse(
-        query=q,
-        offers=offer_items,
-        raw=None,
-    )
+    return OffersResponse(query=q, offers=items, raw=None)
